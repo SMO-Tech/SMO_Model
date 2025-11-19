@@ -46,9 +46,9 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional override for output location (defaults to telemetry directory).",
     )
-    parser.add_argument("--possession_radius_cm", type=float, default=450.0)
-    parser.add_argument("--min_possession_frames", type=int, default=3)
-    parser.add_argument("--pass_timeout_frames", type=int, default=25)
+    parser.add_argument("--possession_radius_cm", type=float, default=600.0)
+    parser.add_argument("--min_possession_frames", type=int, default=2)
+    parser.add_argument("--pass_timeout_frames", type=int, default=50)
     return parser.parse_args()
 
 
@@ -155,8 +155,8 @@ def main() -> None:
                             end_time=timestamp,
                             passer_id=current_owner["id"],
                             receiver_id=owner_candidate["id"],
-                            passer_team=current_owner["team"],
-                            receiver_team=owner_candidate["team"],
+                            passer_team=f"Team {'A' if current_owner['team'] == 0 else 'B'}",
+                            receiver_team=f"Team {'A' if owner_candidate['team'] == 0 else 'B'}",
                             distance_m=distance_m,
                             pass_type=classify_distance(distance_m),
                             outcome=outcome,
@@ -192,7 +192,7 @@ def main() -> None:
                             end_time=timestamp,
                             passer_id=current_owner["id"],
                             receiver_id=None,
-                            passer_team=current_owner["team"],
+                            passer_team=f"Team {'A' if current_owner['team'] == 0 else 'B'}",
                             receiver_team=None,
                             distance_m=None,
                             pass_type="unknown",

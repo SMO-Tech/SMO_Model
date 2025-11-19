@@ -1,0 +1,9 @@
+{
+  "video": "/workspace/niyas_version2/SMO_FINAL/examples/soccer/input_video/test_video_2.mp4",
+  "fps": 25,
+  "player_model": "/workspace/niyas_version2/SMO_FINAL/examples/soccer/data/football-player-detection.pt",
+  "ball_model": "/workspace/niyas_version2/SMO_FINAL/examples/soccer/data/football-ball-detection.pt",
+  "pitch_model": "/workspace/niyas_version2/SMO_FINAL/examples/soccer/data/football-pitch-detection.pt",
+  "team_classifier_trained": false,
+  "stride": 60
+}

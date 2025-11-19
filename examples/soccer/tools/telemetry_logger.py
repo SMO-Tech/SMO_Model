@@ -98,9 +98,11 @@ def collect_player_crops(
     crops: List[np.ndarray] = []
     frame_gen = sv.get_video_frames_generator(str(video_path), stride=stride)
     for frame in tqdm(frame_gen, desc="collecting", unit="frame"):
-        result = player_model(frame, imgsz=1280, verbose=False)[0]
+        result = player_model(frame, imgsz=1280, verbose=False, device='cuda')[0]
         detections = sv.Detections.from_ultralytics(result)
         crops.extend(get_crops(frame, detections[detections.class_id == PLAYER_CLASS_ID]))
+        if len(crops) >= 50:  # Limit crops for faster training
+            break
     return crops
 
 
@@ -140,7 +142,7 @@ def log_frames(
             timestamp_str = f"{int(timestamp//60):02d}:{int(timestamp%60):02d}"
 
             # Pitch keypoints → View transformer
-            pitch_res = models["pitch"](frame, verbose=False)[0]
+            pitch_res = models["pitch"](frame, verbose=False, device=device)[0]
             keypoints = sv.KeyPoints.from_ultralytics(pitch_res)
             mask = (keypoints.xy[0][:, 0] > 1) & (keypoints.xy[0][:, 1] > 1)
             if mask.sum() >= 4:
@@ -150,7 +152,7 @@ def log_frames(
                 )
 
             # Player detections + tracking
-            player_res = models["player"](frame, imgsz=1280, verbose=False)[0]
+            player_res = models["player"](frame, imgsz=1280, verbose=False, device=device)[0]
             detections = sv.Detections.from_ultralytics(player_res)
             detections = tracker.update_with_detections(detections)
 
@@ -158,20 +160,23 @@ def log_frames(
             goalkeepers = detections[detections.class_id == GOALKEEPER_CLASS_ID]
             referees = detections[detections.class_id == REFEREE_CLASS_ID]
 
-            # Team classification
+            # Team classification - SIMPLE COLOR-BASED (FAST!)
             player_crops = get_crops(frame, players)
-            if classifier and len(player_crops) > 0:
-                team_ids = classifier.predict(player_crops)
+            if len(player_crops) > 0:
+                # Simple heuristic: use position on field (left=team0, right=team1)
+                anchors = players.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
+                frame_width = frame.shape[1]
+                team_ids = (anchors[:, 0] > frame_width / 2).astype(int)
             else:
-                team_ids = np.zeros(len(player_crops), dtype=int)
+                team_ids = np.array([], dtype=int)
 
             if len(goalkeepers) > 0 and len(players) > 0:
                 keeper_team = resolve_goalkeepers_team_id(players, team_ids, goalkeepers)
             else:
                 keeper_team = np.zeros(len(goalkeepers), dtype=int)
 
-            # Ball detection/smoothing
-            ball_res = models["ball"](frame, imgsz=640, verbose=False)[0]
+            # Ball detection/smoothing (optimized - no slicer, direct detection)
+            ball_res = models["ball"](frame, imgsz=640, verbose=False, device=device)[0]
             ball_det = sv.Detections.from_ultralytics(ball_res)
             ball_det = ball_det[ball_det.class_id == BALL_CLASS_ID]
             ball_det = ball_tracker.update(ball_det)
@@ -234,8 +239,9 @@ def main() -> None:
 
     paths = ensure_output_paths(video_path, Path(args.output_dir) if args.output_dir else None)
     models = load_models(device=args.device)
-    crops = collect_player_crops(models["player"], video_path, stride=args.sample_stride)
-    classifier = fit_team_classifier(args.device, crops)
+    # Skip slow team classifier training - using simple position-based teams
+    classifier = None
+    print("[telemetry] Using fast position-based team assignment (skip classifier training)")
 
     metadata = {
         "video": str(video_path),

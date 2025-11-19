@@ -1,0 +1,27 @@
+start_time,end_time,start_frame,end_frame,passer_id,receiver_id,passer_team,receiver_team,distance_m,pass_type,outcome
+00:01,00:01,25,26,22,3,Team A,Team A,6.16,short,successful
+00:01,00:02,32,50,3,13,Team A,Team B,20.33,medium,intercepted
+00:03,00:04,80,108,13,2,Team B,Team B,32.86,medium,successful
+00:05,00:05,140,143,13,3,Team B,Team B,12.26,short,successful
+00:06,00:06,154,156,3,9,Team B,Team B,6.54,short,successful
+00:06,00:07,164,180,9,22,Team B,Team B,23.44,medium,successful
+00:07,00:07,184,186,22,11,Team B,Team B,29.74,medium,successful
+00:08,00:08,211,215,22,3,Team B,Team B,3.13,short,successful
+00:08,00:09,220,225,3,20,Team B,Team B,14.33,short,successful
+00:09,00:09,234,235,20,13,Team B,Team B,3.97,short,successful
+00:09,00:09,242,248,13,12,Team B,Team B,17.25,short,successful
+00:10,00:11,272,288,28,29,Team B,Team B,13.41,short,successful
+00:12,00:12,302,319,28,2,Team B,Team B,16.77,short,successful
+00:12,00:13,320,345,2,29,Team B,Team B,8.75,short,successful
+00:13,00:14,347,352,29,20,Team B,Team B,8.83,short,successful
+00:14,00:15,354,385,20,13,Team B,Team B,23.46,medium,successful
+00:15,00:16,393,406,13,3,Team B,Team B,5.51,short,successful
+00:18,00:20,467,517,3,,Team B,,,unknown,lost
+00:24,00:24,602,603,1,20,Team B,Team B,6.28,short,successful
+00:24,00:24,608,609,20,13,Team B,Team B,4.82,short,successful
+00:24,00:25,624,626,13,20,Team B,Team B,3.04,short,successful
+00:25,00:25,638,640,1,20,Team B,Team B,3.37,short,successful
+00:25,00:26,648,650,20,13,Team B,Team B,9.04,short,successful
+00:27,00:27,682,683,13,31,Team B,Team B,5.70,short,successful
+00:27,00:27,684,687,31,11,Team B,Team B,34.80,medium,successful
+00:27,00:29,687,737,11,,Team B,,,unknown,lost
