@@ -1,0 +1,9 @@
+{
+  "video": "data/0bfacc_0.mp4",
+  "fps": 25,
+  "player_model": "/Users/essashah/Desktop/SWE/SMO_ACCURATE/Phase1_SMO_Accurate/examples/soccer/data/football-player-detection.pt",
+  "ball_model": "/Users/essashah/Desktop/SWE/SMO_ACCURATE/Phase1_SMO_Accurate/examples/soccer/data/football-ball-detection.pt",
+  "pitch_model": "/Users/essashah/Desktop/SWE/SMO_ACCURATE/Phase1_SMO_Accurate/examples/soccer/data/football-pitch-detection.pt",
+  "team_classifier_trained": true,
+  "stride": 60
+}

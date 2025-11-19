@@ -110,6 +110,50 @@ on the field.
 
   https://github.com/user-attachments/assets/263b4cd0-2185-4ed3-9be2-cf4d8f5bfa67
 
+## 📊 Offline telemetry & advanced analytics
+
+Because the real-time demo is intentionally lightweight, we provide standalone
+tools under `examples/soccer/tools/` to generate richer visualisations
+without altering `main.py`.
+
+### Telemetry logging
+
+```
+cd examples/soccer
+python tools/telemetry_logger.py \
+  --source_video_path data/0bfacc_0.mp4 \
+  --device cpu
+```
+
+This command reuses the YOLO + ByteTrack + team-classifier pipeline to emit a
+frame-by-frame log (`analysis/<video>/telemetry.jsonl`) and a companion
+`metadata.json`. Each record contains:
+
+- Tracker IDs for players/goalkeepers/referees
+- Team assignments (0/1) inferred from SigLIP → UMAP → KMeans
+- Image-space + pitch-space coordinates
+- Ball visibility, position and confidence
+
+### Control map & smoothed ball trajectory (point 7 & 8)
+
+```
+python tools/control_map_visualizer.py \
+  --telemetry_path analysis/0bfacc_0/telemetry.jsonl \
+  --metadata_path analysis/0bfacc_0/metadata.json \
+  --video_path data/0bfacc_0.mp4
+```
+
+Outputs `analysis/<video>/enhanced_control_map.avi` featuring:
+
+- Voronoi-style team dominance heatmaps (grid-based nearest-player control)
+- Player markers per team, drawn on a radar/pitch inset
+- Smoothed ball trajectory (configurable moving-average window) with trail
+- Graceful handling of missing detections (reuse last-known coordinates)
+- Blended overlay into the broadcast feed (bottom-right picture-in-picture)
+
+Because both steps run offline, you can iterate on analytics (pass timelines,
+possession charts, etc.) without touching the core demo.
+
 ## 🗺️ roadmap
 
 - [ ] Add smoothing to eliminate flickering in RADAR mode.
