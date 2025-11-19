@@ -409,14 +409,33 @@ def main(source_video_path: str, target_video_path: str, device: str, mode: Mode
         raise NotImplementedError(f"Mode {mode} is not implemented.")
 
     video_info = sv.VideoInfo.from_video_path(source_video_path)
+    print(f"Processing video: {source_video_path}")
+    print(f"Output video: {target_video_path}")
+    print(f"Total frames: {video_info.total_frames}")
+    print(f"Mode: {mode.value}")
+    
     with sv.VideoSink(target_video_path, video_info) as sink:
-        for frame in frame_generator:
-            sink.write_frame(frame)
+        frame_count = 0
+        with tqdm(total=video_info.total_frames, desc="Saving frames to video") as pbar:
+            for frame in frame_generator:
+                sink.write_frame(frame)
+                frame_count += 1
+                pbar.update(1)
 
-            cv2.imshow("frame", frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
-        cv2.destroyAllWindows()
+                # Try to show preview window, but continue if display is not available
+                try:
+                    cv2.imshow("frame", frame)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        break
+                except cv2.error:
+                    # No display available, continue processing
+                    pass
+        try:
+            cv2.destroyAllWindows()
+        except cv2.error:
+            pass
+    
+    print(f"Successfully saved {frame_count} frames to {target_video_path}")
 
 
 if __name__ == '__main__':
