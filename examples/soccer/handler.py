@@ -16,9 +16,13 @@ else:
     # Already in soccer directory
     sys.path.insert(0, str(handler_dir))
 
-from tools.telemetry_logger import main as run_telemetry
-from tools.pass_events_from_telemetry import main as run_pass_detection
-from tools.api_client import send_pass_data_with_summary
+# Import will happen after path setup
+try:
+    from tools.api_client import send_pass_data_with_summary
+except ImportError:
+    # Fallback if api_client not available
+    def send_pass_data_with_summary(*args, **kwargs):
+        return {"success": False, "error": "API client not available"}
 
 
 def download_video(url: str, output_path: str) -> str:
@@ -37,7 +41,19 @@ def download_video(url: str, output_path: str) -> str:
 
 def ensure_models():
     """Ensure model files exist, download if needed"""
-    data_dir = Path(__file__).parent / 'examples' / 'soccer' / 'data'
+    # Determine correct paths based on where handler.py is located
+    handler_dir = Path(__file__).parent
+    
+    # Check if we're in examples/soccer directory or at root
+    if (handler_dir / 'examples' / 'soccer').exists():
+        soccer_dir = handler_dir / 'examples' / 'soccer'
+    elif (handler_dir / 'data').exists():
+        soccer_dir = handler_dir
+    else:
+        # Try to find it
+        soccer_dir = Path('/app/examples/soccer') if Path('/app').exists() else handler_dir
+    
+    data_dir = soccer_dir / 'data'
     models = [
         'football-player-detection.pt',
         'football-ball-detection.pt',
@@ -47,8 +63,11 @@ def ensure_models():
     missing = [m for m in models if not (data_dir / m).exists()]
     if missing:
         print(f"Downloading missing models: {missing}")
-        setup_script = Path(__file__).parent / 'examples' / 'soccer' / 'setup.sh'
-        subprocess.run(['bash', str(setup_script)], check=True)
+        setup_script = soccer_dir / 'setup.sh'
+        if setup_script.exists():
+            subprocess.run(['bash', str(setup_script)], check=True, cwd=str(soccer_dir))
+        else:
+            print(f"⚠️  setup.sh not found at {setup_script}, models must be downloaded manually")
 
 
 def handler(event):
@@ -189,12 +208,16 @@ def handler(event):
                     with open(metadata_path, 'r') as f:
                         metadata["video_metadata"] = json.load(f)
                 
+                # Import here to ensure path is set
+                from tools.api_client import send_pass_data_with_summary
+                
                 # Send to API
                 api_result = send_pass_data_with_summary(
                     json_path=json_path,
                     api_url=api_url,
                     video_id=video_id or video_path.stem,
                     metadata=metadata,
+                    headers=api_headers,
                     timeout=30
                 )
                 
@@ -238,3 +261,5 @@ if __name__ == "__main__":
     
     result = handler(event)
     print(json.dumps(result, indent=2))
+
+
