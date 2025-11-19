@@ -152,4 +152,16 @@ Desktop.ini
 # Linux
 *~
 .directory
-.Trash-*
+.Trash-*# Model files (download via setup.sh)
+examples/soccer/data/*.pt
+examples/soccer/data/*.mp4
+
+# Analysis output
+examples/soccer/data/analysis/
+examples/soccer/input_video/analysis/
+*.jsonl
+*.csv
+*.json
+
+# Logs
+*.log
