@@ -165,3 +165,5 @@ examples/soccer/input_video/analysis/
 
 # Logs
 *.log
+
+vnev/

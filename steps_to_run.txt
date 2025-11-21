@@ -1,0 +1,10 @@
+    python tools/telemetry_logger.py \
+      --source_video_path /workspace/niyas_version2/SMO_FINAL/examples/soccer/input_video/test_video.mp4 \
+      --output_dir /workspace/niyas_version2/SMO_FINAL/examples/soccer/analysis/test_video_telemetry \
+      --device cuda
+
+    python tools/pass_events_from_telemetry.py \
+      --telemetry_path /workspace/niyas_version2/SMO_FINAL/examples/soccer/input_video/analysis/test_video/telemetry.jsonl \
+      --metadata_path /workspace/niyas_version2/SMO_FINAL/examples/soccer/input_video/analysis/test_video/metadata.json \
+      --output_dir /workspace/niyas_version2/SMO_FINAL/examples/soccer/input_video/analysis/test_video
+[passes] Detected 20 events -> /workspace/niyas_version2/SMO_FINAL/examples/soccer/input_video/analysis/test_video/passes_from_telemetry.csv

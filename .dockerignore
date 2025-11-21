@@ -1,45 +1,19 @@
-# Git
-.git/
-.gitignore
-.gitattributes
-
-# Python
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
-.Python
-*.so
-*.egg
-*.egg-info
-dist/
-build/
+*.log
 .venv/
 venv/
-vnev/
+.git/
+.gitignore
+.dockerignore
 
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
+# Ignore large model files if they are downloaded at runtime by the handler
+# or if you are using Git LFS for them.
+# Uncomment these lines if you don't want to include models in the Docker image directly
+# SMO_FINAL/examples/soccer/data/football-player-detection.pt
+# SMO_FINAL/examples/soccer/data/football-ball-detection.pt
+# SMO_FINAL/examples/soccer/data/football-pitch-detection.pt
 
-# Documentation
-*.md
-docs/
-README*
-
-# Data and outputs
-examples/soccer/data/*.pt
-examples/soccer/data/*.mp4
-examples/soccer/data/analysis/
-examples/soccer/input_video/
-*.jsonl
-*.csv
-*.json
-*.log
-
-# OS
-.DS_Store
-Thumbs.db
-
+# Ignore generated output data
+SMO_FINAL/examples/soccer/output/
+SMO_FINAL/examples/soccer/analysis/
