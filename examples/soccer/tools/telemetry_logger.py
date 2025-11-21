@@ -30,6 +30,8 @@ ROOT_DIR = TOOLS_DIR.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
+sys.path.append('/workspace/niyas_version2/SMO_FINAL')
+
 from sports.common.ball import BallTracker
 from sports.common.team import TeamClassifier
 from sports.common.view import ViewTransformer

@@ -9,6 +9,9 @@ import supervision as sv
 from tqdm import tqdm
 from ultralytics import YOLO
 
+import sys
+sys.path.append('/workspace/niyas_version2/SMO_FINAL')
+
 from sports.annotators.soccer import draw_pitch, draw_points_on_pitch
 from sports.common.ball import BallTracker, BallAnnotator
 from sports.common.team import TeamClassifier
@@ -423,17 +426,17 @@ def main(source_video_path: str, target_video_path: str, device: str, mode: Mode
                 pbar.update(1)
 
                 # Try to show preview window, but continue if display is not available
-                try:
-                    cv2.imshow("frame", frame)
-                    if cv2.waitKey(1) & 0xFF == ord("q"):
-                        break
-                except cv2.error:
-                    # No display available, continue processing
-                    pass
-        try:
-            cv2.destroyAllWindows()
-        except cv2.error:
-            pass
+                # try:
+                #     cv2.imshow("frame", frame)
+                #     if cv2.waitKey(1) & 0xFF == ord("q"):
+                #         break
+                # except cv2.error:
+                #     # No display available, continue processing
+                #     pass
+        # try:
+        #     cv2.destroyAllWindows()
+        # except cv2.error:
+        #     pass
     
     print(f"Successfully saved {frame_count} frames to {target_video_path}")
 

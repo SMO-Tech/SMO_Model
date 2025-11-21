@@ -7,6 +7,7 @@ import sys
 import traceback
 from pathlib import Path
 import subprocess
+import requests # Added for API calls
 
 # Add soccer examples to path
 handler_dir = Path(__file__).parent
@@ -80,8 +81,9 @@ def handler(event):
             "video_url": "https://...",  # or "video_path": "/path/to/video.mp4"
             "device": "cuda",  # optional, default: "cuda"
             "output_dir": "/path/to/output",  # optional
-            "api_url": "https://api.example.com/api/passes",  # optional: API endpoint to send JSON data
-            "api_headers": {"Authorization": "Bearer token"},  # optional: custom headers for API
+            "base_api_url": "https://app.wizard.net.co", # Required: Base URL for match API
+            "match_id": "fb7e5817-9a84-44f1-bcb8-d5cfeca7d647", # Required: Match ID for API calls
+            "api_key": "YOUR_API_KEY", # Required: API Key for authorization
             "video_id": "video_123"  # optional: video identifier for API
         }
     }
@@ -93,8 +95,33 @@ def handler(event):
         video_path = input_data.get('video_path')
         device = input_data.get('device', 'cuda')
         output_dir = input_data.get('output_dir')
-        api_url = input_data.get('api_url')  # Optional API endpoint
-        api_headers = input_data.get('api_headers')  # Optional API headers
+        
+        base_api_url = input_data.get('base_api_url')
+        match_id = input_data.get('match_id')
+        api_key = input_data.get('api_key')
+
+        if not base_api_url or not match_id or not api_key:
+            return {
+                "error": "Missing required API parameters: base_api_url, match_id, or api_key"
+            }
+        
+        api_headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}"
+        }
+        
+        # Step 0: Update match status to PROCESSING
+        print(f"Step 0: Updating match {match_id} status to PROCESSING...")
+        try:
+            status_url = f"{base_api_url}/match/{match_id}"
+            response = requests.post(status_url, headers=api_headers, json={"status": "PROCESSING"})
+            response.raise_for_status()
+            print(f"✅ Match status updated to PROCESSING. Response: {response.status_code}")
+        except requests.exceptions.RequestException as e:
+            error_msg = f"Failed to update match status to PROCESSING: {e}"
+            print(f"⚠️  {error_msg}")
+            return {"error": error_msg}
+
         video_id = input_data.get('video_id')  # Optional video ID
         
         # Ensure models are available
@@ -191,50 +218,44 @@ def handler(event):
         
         print(f"✅ Analysis complete! Found {results.get('total_passes', 0)} passes")
         
-        # Step 3: Send data to API if API URL is provided
-        if api_url and json_path.exists():
-            print(f"Step 3: Sending pass data to API: {api_url}")
+        # Step 3: Send pass results to API
+        if json_path.exists():
+            print(f"Step 3: Sending pass results to API: {base_api_url}/match/{match_id}/results")
             try:
-                # Prepare metadata
-                metadata = {
-                    "video_path": str(video_path),
-                    "telemetry_file": str(telemetry_path),
-                    "metadata_file": str(metadata_path),
-                    "device": device
-                }
+                with open(json_path, 'r') as f:
+                    pass_results = json.load(f)
                 
-                # Load metadata.json if available
-                if metadata_path.exists():
-                    with open(metadata_path, 'r') as f:
-                        metadata["video_metadata"] = json.load(f)
-                
-                # Import here to ensure path is set
-                from tools.api_client import send_pass_data_with_summary
-                
-                # Send to API
-                api_result = send_pass_data_with_summary(
-                    json_path=json_path,
-                    api_url=api_url,
-                    video_id=video_id or video_path.stem,
-                    metadata=metadata,
-                    headers=api_headers,
-                    timeout=30
-                )
-                
-                if api_result.get("success"):
-                    results["api_status"] = "sent"
-                    results["api_response"] = api_result.get("response", {})
-                    results["api_summary"] = api_result.get("summary", {})
-                    print(f"✅ Data sent to API successfully! Status: {api_result.get('status_code')}")
-                else:
-                    results["api_status"] = "failed"
-                    results["api_error"] = api_result.get("error", "Unknown error")
-                    print(f"⚠️  Failed to send data to API: {api_result.get('error')}")
-                    
-            except Exception as api_error:
-                results["api_status"] = "error"
-                results["api_error"] = str(api_error)
-                print(f"⚠️  Error sending data to API: {str(api_error)}")
+                results_url = f"{base_api_url}/match/{match_id}/results"
+                response = requests.post(results_url, headers=api_headers, json={"result": pass_results})
+                response.raise_for_status()
+                results["results_api_status"] = "sent"
+                results["results_api_response"] = response.status_code
+                print(f"✅ Pass results sent to API successfully! Status: {response.status_code}")
+            except requests.exceptions.RequestException as e:
+                error_msg = f"Failed to send pass results to API: {e}"
+                print(f"⚠️  {error_msg}")
+                results["results_api_status"] = "failed"
+                results["results_api_error"] = error_msg
+            except json.JSONDecodeError as e:
+                error_msg = f"Failed to decode passes_from_telemetry.json: {e}"
+                print(f"⚠️  {error_msg}")
+                results["results_api_status"] = "failed"
+                results["results_api_error"] = error_msg
+
+        # Step 4: Update match status to COMPLETED
+        print(f"Step 4: Updating match {match_id} status to COMPLETED...")
+        try:
+            status_url = f"{base_api_url}/match/{match_id}"
+            response = requests.post(status_url, headers=api_headers, json={"status": "COMPLETED"})
+            response.raise_for_status()
+            results["final_status_api_status"] = "sent"
+            results["final_status_api_response"] = response.status_code
+            print(f"✅ Match status updated to COMPLETED. Response: {response.status_code}")
+        except requests.exceptions.RequestException as e:
+            error_msg = f"Failed to update match status to COMPLETED: {e}"
+            print(f"⚠️  {error_msg}")
+            results["final_status_api_status"] = "failed"
+            results["final_status_api_error"] = error_msg
         
         return results
         
