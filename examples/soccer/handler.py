@@ -19,11 +19,20 @@ else:
 
 # Import will happen after path setup
 try:
-    from tools.api_client import send_pass_data_with_summary
+    from tools.api_client import send_pass_data_with_summary, DummyAPIClient # Import DummyAPIClient
 except ImportError:
     # Fallback if api_client not available
     def send_pass_data_with_summary(*args, **kwargs):
         return {"success": False, "error": "API client not available"}
+    # Define a basic DummyAPIClient if not imported, to prevent errors
+    class DummyAPIClient:
+        def __init__(self, *args, **kwargs): pass
+        def update_match_status(self, *args, **kwargs): 
+            print("DummyAPIClient not fully initialized: update_match_status")
+            return {"success": False, "error": "Dummy API client not available"}
+        def send_match_results(self, *args, **kwargs): 
+            print("DummyAPIClient not fully initialized: send_match_results")
+            return {"success": False, "error": "Dummy API client not available"}
 
 
 def download_video(url: str, output_path: str) -> str:
@@ -105,6 +114,11 @@ def handler(event):
                 "error": "Missing required API parameters: base_api_url, match_id, or api_key"
             }
         
+        # Initialize the API client for local testing or production
+        # For local testing, ensure DummyAPIClient is used.
+        # For production, this would be a real APIClient.
+        api_client = DummyAPIClient(base_api_url, match_id, api_key)
+
         api_headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {api_key}"
@@ -113,10 +127,11 @@ def handler(event):
         # Step 0: Update match status to PROCESSING
         print(f"Step 0: Updating match {match_id} status to PROCESSING...")
         try:
-            status_url = f"{base_api_url}/match/{match_id}"
-            response = requests.post(status_url, headers=api_headers, json={"status": "PROCESSING"})
-            response.raise_for_status()
-            print(f"✅ Match status updated to PROCESSING. Response: {response.status_code}")
+            # Use api_client wrapper for status update
+            api_response = api_client.update_match_status(status="PROCESSING")
+            if not api_response["success"]:
+                raise requests.exceptions.RequestException(api_response.get("error", "Unknown error from API client"))
+            print(f"✅ Match status updated to PROCESSING. Response: {api_response.get('status_code', 'N/A')}")
         except requests.exceptions.RequestException as e:
             error_msg = f"Failed to update match status to PROCESSING: {e}"
             print(f"⚠️  {error_msg}")
@@ -225,12 +240,14 @@ def handler(event):
                 with open(json_path, 'r') as f:
                     pass_results = json.load(f)
                 
-                results_url = f"{base_api_url}/match/{match_id}/results"
-                response = requests.post(results_url, headers=api_headers, json={"result": pass_results})
-                response.raise_for_status()
+                # Use api_client wrapper to send results
+                api_response = api_client.send_match_results(results_data={"result": pass_results})
+                if not api_response["success"]:
+                    raise requests.exceptions.RequestException(api_response.get("error", "Unknown error from API client"))
+
                 results["results_api_status"] = "sent"
-                results["results_api_response"] = response.status_code
-                print(f"✅ Pass results sent to API successfully! Status: {response.status_code}")
+                results["results_api_response"] = api_response.get("status_code", 'N/A')
+                print(f"✅ Pass results sent to API successfully! Status: {api_response.get('status_code', 'N/A')}")
             except requests.exceptions.RequestException as e:
                 error_msg = f"Failed to send pass results to API: {e}"
                 print(f"⚠️  {error_msg}")
@@ -245,12 +262,14 @@ def handler(event):
         # Step 4: Update match status to COMPLETED
         print(f"Step 4: Updating match {match_id} status to COMPLETED...")
         try:
-            status_url = f"{base_api_url}/match/{match_id}"
-            response = requests.post(status_url, headers=api_headers, json={"status": "COMPLETED"})
-            response.raise_for_status()
+            # Use api_client wrapper for final status update
+            api_response = api_client.update_match_status(status="COMPLETED")
+            if not api_response["success"]:
+                raise requests.exceptions.RequestException(api_response.get("error", "Unknown error from API client"))
+
             results["final_status_api_status"] = "sent"
-            results["final_status_api_response"] = response.status_code
-            print(f"✅ Match status updated to COMPLETED. Response: {response.status_code}")
+            results["final_status_api_response"] = api_response.get("status_code", 'N/A')
+            print(f"✅ Match status updated to COMPLETED. Response: {api_response.get('status_code', 'N/A')}")
         except requests.exceptions.RequestException as e:
             error_msg = f"Failed to update match status to COMPLETED: {e}"
             print(f"⚠️  {error_msg}")

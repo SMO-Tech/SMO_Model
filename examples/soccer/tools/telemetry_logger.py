@@ -146,12 +146,19 @@ def log_frames(
             # Pitch keypoints → View transformer
             pitch_res = models["pitch"](frame, verbose=False, device=device)[0]
             keypoints = sv.KeyPoints.from_ultralytics(pitch_res)
-            mask = (keypoints.xy[0][:, 0] > 1) & (keypoints.xy[0][:, 1] > 1)
-            if mask.sum() >= 4:
-                transformer = ViewTransformer(
-                    source=keypoints.xy[0][mask].astype(np.float32),
-                    target=np.array(CONFIG.vertices)[mask].astype(np.float32),
-                )
+            
+            # Ensure keypoints are not empty before proceeding
+            if len(keypoints.xy) > 0 and len(keypoints.xy[0]) > 0:
+                mask = (keypoints.xy[0][:, 0] > 1) & (keypoints.xy[0][:, 1] > 1)
+                if mask.sum() >= 4:
+                    transformer = ViewTransformer(
+                        source=keypoints.xy[0][mask].astype(np.float32),
+                        target=np.array(CONFIG.vertices)[mask].astype(np.float32),
+                    )
+                else:
+                    transformer = None # Reset transformer if not enough keypoints
+            else:
+                transformer = None # Reset transformer if no keypoints detected
 
             # Player detections + tracking
             player_res = models["player"](frame, imgsz=1280, verbose=False, device=device)[0]
