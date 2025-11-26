@@ -1,8 +1,9 @@
 import argparse
-from enum import Enum
-from typing import Iterator, List
-
+import csv
+import json
 import os
+from enum import Enum
+from typing import Any, Dict, Iterator, List, Optional, Set
 import cv2
 import numpy as np
 import supervision as sv
@@ -70,6 +71,188 @@ ELLIPSE_LABEL_ANNOTATOR = sv.LabelAnnotator(
 )
 
 
+CLASS_NAME_LOOKUP = {
+    BALL_CLASS_ID: "ball",
+    GOALKEEPER_CLASS_ID: "goalkeeper",
+    PLAYER_CLASS_ID: "player",
+    REFEREE_CLASS_ID: "referee",
+}
+
+PASS_DISTANCE_THRESHOLD_PX = 250
+
+
+def create_empty_detections() -> sv.Detections:
+    if hasattr(sv.Detections, "empty"):
+        return sv.Detections.empty()  # type: ignore[attr-defined]
+    return sv.Detections(
+        xyxy=np.empty((0, 4), dtype=np.float32),
+        confidence=np.empty((0,), dtype=np.float32),
+        class_id=np.empty((0,), dtype=np.int64),
+    )
+
+
+def ensure_output_dirs(base_dir: str) -> Dict[str, str]:
+    tracked_dir = os.path.join(base_dir, 'tracked')
+    missed_dir = os.path.join(base_dir, 'missed')
+    os.makedirs(tracked_dir, exist_ok=True)
+    os.makedirs(missed_dir, exist_ok=True)
+    return {"tracked": tracked_dir, "missed": missed_dir}
+
+
+def build_player_labels(detections: sv.Detections) -> List[str]:
+    labels = []
+    if len(detections) == 0:
+        return labels
+    tracker_ids = detections.tracker_id
+    class_ids = detections.class_id
+    for idx in range(len(detections)):
+        class_id = int(class_ids[idx]) if class_ids is not None else -1
+        tracker_id = tracker_ids[idx] if tracker_ids is not None else None
+        class_name = CLASS_NAME_LOOKUP.get(class_id, "object")
+        labels.append(
+            f"{class_name} #{int(tracker_id)}" if tracker_id is not None else class_name
+        )
+    return labels
+
+
+def serialize_player_tracks(detections: sv.Detections) -> List[Dict[str, Any]]:
+    serialized: List[Dict[str, Any]] = []
+    if len(detections) == 0:
+        return serialized
+    bottom_centers = detections.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
+    for idx, bbox in enumerate(detections.xyxy):
+        tracker_id = None
+        if detections.tracker_id is not None:
+            tracker_idx = detections.tracker_id[idx]
+            tracker_id = int(tracker_idx) if tracker_idx is not None else None
+        class_id = None
+        if detections.class_id is not None:
+            class_id = int(detections.class_id[idx])
+        if class_id not in {PLAYER_CLASS_ID, GOALKEEPER_CLASS_ID}:
+            continue
+        serialized.append({
+            "tracker_id": tracker_id,
+            "class_id": class_id,
+            "bbox": bbox.tolist(),
+            "bottom_center": bottom_centers[idx].tolist(),
+        })
+    return serialized
+
+
+def find_nearest_player(
+    ball_center: Optional[List[float]],
+    player_tracks: List[Dict[str, Any]],
+    max_distance: float = 75.0
+) -> Optional[int]:
+    if ball_center is None or player_tracks == []:
+        return None
+    ball_xy = np.array(ball_center)
+    min_distance = float('inf')
+    best_tracker = None
+    for track in player_tracks:
+        player_xy = np.array(track["bottom_center"])
+        distance = np.linalg.norm(ball_xy - player_xy)
+        if distance < min_distance:
+            min_distance = distance
+            best_tracker = track["tracker_id"]
+    if min_distance <= max_distance:
+        return best_tracker
+    return None
+
+
+def detect_passes(
+    frames_metadata: List[Dict[str, Any]],
+    fps: float,
+    distance_threshold_px: float = PASS_DISTANCE_THRESHOLD_PX
+) -> List[Dict[str, Any]]:
+    events: List[Dict[str, Any]] = []
+    current_owner: Optional[int] = None
+    potential_pass: Optional[Dict[str, Any]] = None
+    last_logged_pass: Optional[Tuple[int, int]] = None  # (passer_id, receiver_id)
+
+    for entry in frames_metadata:
+        frame_index = entry["frame_index"]
+        timestamp = entry["timestamp"]
+        ball_center = entry.get("ball_center")
+        player_tracks = entry.get("player_tracks", [])
+        owner = find_nearest_player(ball_center, player_tracks)
+
+        if owner is not None and current_owner is None:
+            current_owner = owner
+            continue
+
+        if current_owner is None:
+            current_owner = owner
+            continue
+
+        if owner == current_owner:
+            potential_pass = None
+            continue
+
+        if owner is None and entry["status"] == "tracked":
+            if potential_pass is None:
+                potential_pass = {
+                    "passer": current_owner,
+                    "start_frame": frame_index,
+                    "start_time": timestamp,
+                    "start_pos": ball_center,
+                }
+            continue
+
+        if owner is not None and owner != current_owner and potential_pass is not None:
+            # Check if this is a duplicate of the last logged pass
+            if last_logged_pass == (potential_pass["passer"], owner):
+                # Same passer→receiver pair; skip duplicate
+                continue
+            
+            distance = 0.0
+            if potential_pass["start_pos"] and ball_center:
+                distance = float(
+                    np.linalg.norm(
+                        np.array(potential_pass["start_pos"]) - np.array(ball_center)
+                    )
+                )
+            duration = timestamp - potential_pass["start_time"]
+            pass_type = "long" if distance >= distance_threshold_px else "short"
+            events.append({
+                "start_frame": potential_pass["start_frame"],
+                "start_time": potential_pass["start_time"],
+                "end_frame": frame_index,
+                "end_time": timestamp,
+                "passer_id": potential_pass["passer"],
+                "receiver_id": owner,
+                "distance_px": distance,
+                "duration_s": duration,
+                "pass_type": pass_type,
+            })
+            last_logged_pass = (potential_pass["passer"], owner)
+            current_owner = owner
+            potential_pass = None
+
+    return events
+
+
+def export_pass_events_to_csv(events: List[Dict[str, Any]], csv_path: str) -> None:
+    if not events:
+        with open(csv_path, 'w', newline='', encoding='utf-8') as csv_file:
+            writer = csv.writer(csv_file)
+            writer.writerow([
+                "start_frame", "start_time", "end_frame", "end_time",
+                "passer_id", "receiver_id", "distance_px", "duration_s", "pass_type"
+            ])
+        return
+
+    fieldnames = [
+        "start_frame", "start_time", "end_frame", "end_time",
+        "passer_id", "receiver_id", "distance_px", "duration_s", "pass_type"
+    ]
+    with open(csv_path, 'w', newline='', encoding='utf-8') as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        writer.writeheader()
+        for event in events:
+            writer.writerow(event)
+
+
 class Mode(Enum):
     """
     Enum class representing different modes of operation for Soccer AI video analysis.
@@ -80,6 +263,7 @@ class Mode(Enum):
     PLAYER_TRACKING = 'PLAYER_TRACKING'
     TEAM_CLASSIFICATION = 'TEAM_CLASSIFICATION'
     RADAR = 'RADAR'
+    BALL_DETECTION_RECOVERY = 'BALL_DETECTION_RECOVERY'
 
 
 def get_crops(frame: np.ndarray, detections: sv.Detections) -> List[np.ndarray]:
@@ -226,7 +410,6 @@ def run_ball_detection(source_video_path: str, device: str) -> Iterator[np.ndarr
 
     slicer = sv.InferenceSlicer(
         callback=callback,
-        overlap_filter_strategy=sv.OverlapFilter.NONE,
         slice_wh=(640, 640),
     )
 
@@ -236,6 +419,131 @@ def run_ball_detection(source_video_path: str, device: str) -> Iterator[np.ndarr
         annotated_frame = frame.copy()
         annotated_frame = ball_annotator.annotate(annotated_frame, detections)
         yield annotated_frame
+
+
+def run_ball_detection_with_recovery(
+    source_video_path: str,
+    target_video_path: str,
+    device: str,
+    output_dir: str,
+    pass_csv_path: Optional[str] = None,
+    recovery_imgsz: int = 960,
+    show_preview: bool = False
+) -> None:
+    """
+    Run ball detection with a recovery pass and export annotated frames plus pass stats.
+    """
+    if not output_dir:
+        raise ValueError("ball_output_dir is required for BALL_DETECTION_RECOVERY mode.")
+
+    os.makedirs(output_dir, exist_ok=True)
+    directories = ensure_output_dirs(output_dir)
+    metadata_path = os.path.join(output_dir, "ball_detections.json")
+    if pass_csv_path is None:
+        pass_csv_path = os.path.join(output_dir, "pass_events.csv")
+
+    video_info = sv.VideoInfo.from_video_path(source_video_path)
+    fps = video_info.fps if video_info.fps else 30.0
+
+    ball_detection_model = YOLO(BALL_DETECTION_MODEL_PATH).to(device=device)
+    recovery_detection_model = YOLO(BALL_DETECTION_MODEL_PATH).to(device=device)
+    player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
+
+    def base_callback(image_slice: np.ndarray) -> sv.Detections:
+        result = ball_detection_model(image_slice, imgsz=640, verbose=False)[0]
+        return sv.Detections.from_ultralytics(result)
+
+    slicer = sv.InferenceSlicer(callback=base_callback, slice_wh=(640, 640))
+
+    first_pass_detections: List[sv.Detections] = []
+    missed_indices: Set[int] = set()
+    frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
+    
+    print(f"[Pass 1/2] Detecting ball in {video_info.total_frames} frames...")
+    for frame_idx, frame in enumerate(tqdm(frame_generator, total=video_info.total_frames, desc="Ball detection")):
+        detections = slicer(frame).with_nms(threshold=0.1)
+        first_pass_detections.append(detections)
+        if len(detections) == 0:
+            missed_indices.add(frame_idx)
+    
+    print(f"[Pass 1/2] Ball detected in {len(first_pass_detections) - len(missed_indices)} frames, missed in {len(missed_indices)} frames.")
+
+    ball_tracker = BallTracker(buffer_size=20)
+    ball_annotator = BallAnnotator(radius=6, buffer_size=10)
+    player_tracker = sv.ByteTrack(minimum_consecutive_frames=3)
+    metadata: List[Dict[str, Any]] = []
+
+    print(f"[Pass 2/2] Running recovery pass and saving annotated frames...")
+    frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
+    with sv.VideoSink(target_video_path, video_info) as sink:
+        for frame_idx, frame in enumerate(tqdm(frame_generator, total=video_info.total_frames, desc="Recovery & export")):
+            ball_detections = (
+                first_pass_detections[frame_idx]
+                if frame_idx < len(first_pass_detections)
+                else create_empty_detections()
+            )
+            if frame_idx in missed_indices:
+                recovery_result = recovery_detection_model(
+                    frame, imgsz=recovery_imgsz, verbose=False
+                )[0]
+                ball_detections = sv.Detections.from_ultralytics(recovery_result)
+
+            tracked_ball = ball_tracker.update(ball_detections)
+            player_result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
+            player_detections = sv.Detections.from_ultralytics(player_result)
+            tracked_players = player_tracker.update_with_detections(player_detections)
+
+            annotated_frame = frame.copy()
+            annotated_frame = BOX_ANNOTATOR.annotate(annotated_frame, tracked_players)
+            player_labels = build_player_labels(tracked_players)
+            annotated_frame = BOX_LABEL_ANNOTATOR.annotate(
+                annotated_frame, tracked_players, labels=player_labels
+            )
+            status = 'tracked' if len(tracked_ball) > 0 else 'missed'
+            if len(tracked_ball) > 0:
+                annotated_frame = ball_annotator.annotate(annotated_frame, tracked_ball)
+                ball_bbox = tracked_ball.xyxy.tolist()
+                ball_centers = tracked_ball.get_anchors_coordinates(
+                    sv.Position.CENTER
+                ).tolist()
+            else:
+                ball_bbox = []
+                ball_centers = []
+
+            sink.write_frame(annotated_frame)
+            if show_preview:
+                cv2.imshow("frame", annotated_frame)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+
+            target_dir = directories['tracked'] if status == 'tracked' else directories['missed']
+            cv2.imwrite(
+                os.path.join(target_dir, f"frame_{frame_idx:06d}.jpg"),
+                annotated_frame
+            )
+
+            metadata.append({
+                "frame_index": frame_idx,
+                "timestamp": frame_idx / fps,
+                "status": status,
+                "ball_bbox": ball_bbox,
+                "ball_center": ball_centers[0] if ball_centers else None,
+                "player_tracks": serialize_player_tracks(tracked_players),
+            })
+
+    if show_preview:
+        cv2.destroyAllWindows()
+
+    print(f"✓ Saved {len(metadata)} annotated frames.")
+    print(f"✓ Writing metadata to {metadata_path}")
+    with open(metadata_path, 'w', encoding='utf-8') as metadata_file:
+        json.dump(metadata, metadata_file, indent=2)
+
+    print(f"[Pass detection] Analyzing ball trajectories...")
+    pass_events = detect_passes(metadata, fps)
+    export_pass_events_to_csv(pass_events, pass_csv_path)
+    print(f"✓ Exported {len(pass_events)} pass events to {pass_csv_path}")
+    print(f"✓ Done! Check output in: {output_dir}")
 
 
 def run_player_tracking(source_video_path: str, device: str) -> Iterator[np.ndarray]:
@@ -386,7 +694,26 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
         yield annotated_frame
 
 
-def main(source_video_path: str, target_video_path: str, device: str, mode: Mode) -> None:
+def main(
+    source_video_path: str,
+    target_video_path: str,
+    device: str,
+    mode: Mode,
+    show_preview: bool = False,
+    ball_output_dir: Optional[str] = None,
+    pass_csv_path: Optional[str] = None
+) -> None:
+    if mode == Mode.BALL_DETECTION_RECOVERY:
+        run_ball_detection_with_recovery(
+            source_video_path=source_video_path,
+            target_video_path=target_video_path,
+            device=device,
+            output_dir=ball_output_dir or os.path.join(PARENT_DIR, "ball_outputs"),
+            pass_csv_path=pass_csv_path,
+            show_preview=show_preview
+        )
+        return
+
     if mode == Mode.PITCH_DETECTION:
         frame_generator = run_pitch_detection(
             source_video_path=source_video_path, device=device)
@@ -413,9 +740,11 @@ def main(source_video_path: str, target_video_path: str, device: str, mode: Mode
         for frame in frame_generator:
             sink.write_frame(frame)
 
-            cv2.imshow("frame", frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
+            if show_preview:
+                cv2.imshow("frame", frame)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+    if show_preview:
         cv2.destroyAllWindows()
 
 if __name__ == '__main__':
@@ -424,10 +753,16 @@ if __name__ == '__main__':
     parser.add_argument('--target_video_path', type=str, required=True)
     parser.add_argument('--device', type=str, default='cpu')
     parser.add_argument('--mode', type=Mode, default=Mode.PLAYER_DETECTION)
+    parser.add_argument('--ball_output_dir', type=str, default=None)
+    parser.add_argument('--pass_csv_path', type=str, default=None)
+    parser.add_argument('--show_preview', action='store_true')
     args = parser.parse_args()
     main(
         source_video_path=args.source_video_path,
         target_video_path=args.target_video_path,
         device=args.device,
-        mode=args.mode
+        mode=args.mode,
+        show_preview=args.show_preview,
+        ball_output_dir=args.ball_output_dir,
+        pass_csv_path=args.pass_csv_path
     )
