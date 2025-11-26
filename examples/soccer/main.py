@@ -418,7 +418,6 @@ def main(source_video_path: str, target_video_path: str, device: str, mode: Mode
                 break
         cv2.destroyAllWindows()
 
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='')
     parser.add_argument('--source_video_path', type=str, required=True)

@@ -19,6 +19,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import cv2
 import numpy as np
 import supervision as sv
 from tqdm import tqdm
@@ -37,12 +38,15 @@ from main import (  # type: ignore
     BALL_CLASS_ID,
     BALL_DETECTION_MODEL_PATH,
     CONFIG,
+    ELLIPSE_ANNOTATOR,
+    ELLIPSE_LABEL_ANNOTATOR,
     GOALKEEPER_CLASS_ID,
     PLAYER_CLASS_ID,
     PLAYER_DETECTION_MODEL_PATH,
     PITCH_DETECTION_MODEL_PATH,
     REFEREE_CLASS_ID,
     STRIDE,
+    TRIANGLE_ANNOTATOR,
     get_crops,
     resolve_goalkeepers_team_id,
 )
@@ -70,12 +74,19 @@ def ensure_output_paths(video_path: Path, output_dir: Optional[Path]) -> Dict[st
     if output_dir is None:
         base_dir = video_path.parent / "analysis" / video_path.stem
     else:
-        base_dir = output_dir
+        base_dir = Path(output_dir)
     base_dir.mkdir(parents=True, exist_ok=True)
+    frames_dir = base_dir / "frames_with_detections"
+    frames_dir.mkdir(exist_ok=True)
+    missing_ball_dir = base_dir / "frames_missing_ball"
+    missing_ball_dir.mkdir(exist_ok=True)
     return {
         "base": base_dir,
         "telemetry": base_dir / "telemetry.jsonl",
         "metadata": base_dir / "metadata.json",
+        "gaps": base_dir / "ball_gap_windows.json",
+        "frames_dir": frames_dir,
+        "missing_ball_dir": missing_ball_dir,
     }
 
 
@@ -98,10 +109,10 @@ def collect_player_crops(
     crops: List[np.ndarray] = []
     frame_gen = sv.get_video_frames_generator(str(video_path), stride=stride)
     for frame in tqdm(frame_gen, desc="collecting", unit="frame"):
-        result = player_model(frame, imgsz=1280, verbose=False, device='cuda')[0]
+        result = player_model(frame, imgsz=1280, verbose=False)[0]
         detections = sv.Detections.from_ultralytics(result)
         crops.extend(get_crops(frame, detections[detections.class_id == PLAYER_CLASS_ID]))
-        if len(crops) >= 50:  # Limit crops for faster training
+        if len(crops) >= 200:
             break
     return crops
 
@@ -113,6 +124,55 @@ def fit_team_classifier(device: str, crops: List[np.ndarray]) -> Optional[TeamCl
     classifier = TeamClassifier(device=device)
     classifier.fit(crops)
     return classifier
+
+
+def nearest_owner(
+    ball_pitch: np.ndarray,
+    players: List[dict],
+    radius_cm: float,
+) -> Optional[dict]:
+    candidate = None
+    best_dist = radius_cm
+    for entity in players:
+        pid = entity.get("id")
+        team = entity.get("team")
+        pitch = entity.get("pitch")
+        if pid is None or team is None or pitch is None:
+            continue
+        player_vec = np.array(pitch, dtype=float)
+        dist = float(np.linalg.norm(player_vec - ball_pitch))
+        if dist < best_dist:
+            candidate = {
+                "id": pid,
+                "team": team,
+                "dist": dist,
+                "pos": player_vec,
+            }
+            best_dist = dist
+    return candidate
+
+
+def serialize_entities(
+    det: sv.Detections,
+    teams: np.ndarray,
+    transformer: Optional[ViewTransformer],
+) -> List[Dict[str, Any]]:
+    result: List[Dict[str, Any]] = []
+    if len(det) == 0:
+        return result
+    anchors = det.get_anchors_coordinates(sv.Position.BOTTOM_CENTER).astype(np.float32)
+    pitch_pts = transformer.transform_points(anchors) if transformer is not None else None
+    for idx, tid in enumerate(det.tracker_id):
+        entry = {
+            "id": int(tid) if tid is not None else None,
+            "team": int(teams[idx]) if len(teams) > idx else 0,
+            "confidence": float(det.confidence[idx]) if det.confidence is not None else None,
+            "bbox": det.xyxy[idx].astype(float).tolist(),
+            "image": anchors[idx].astype(float).tolist(),
+            "pitch": pitch_pts[idx].astype(float).tolist() if pitch_pts is not None else None,
+        }
+        result.append(entry)
+    return result
 
 
 def write_metadata(path: Path, info: Dict[str, Any]) -> None:
@@ -133,6 +193,12 @@ def log_frames(
     tracker = sv.ByteTrack(minimum_consecutive_frames=3)
     ball_tracker = BallTracker(buffer_size=15)
     transformer: Optional[ViewTransformer] = None
+    last_ball_pitch: Optional[np.ndarray] = None
+    last_ball_frame: Optional[int] = None
+    last_ball_owner: Optional[dict] = None
+    last_ball_speed: float = 0.0
+    ball_gaps: List[Dict[str, int]] = []
+    active_gap: Optional[Dict[str, int]] = None
 
     with output_paths["telemetry"].open("w") as fp, tqdm(
         frame_generator, total=video_info.total_frames, desc="logging", unit="frame"
@@ -160,10 +226,10 @@ def log_frames(
             goalkeepers = detections[detections.class_id == GOALKEEPER_CLASS_ID]
             referees = detections[detections.class_id == REFEREE_CLASS_ID]
 
-            # Team classification - SIMPLE COLOR-BASED (FAST!)
             player_crops = get_crops(frame, players)
-            if len(player_crops) > 0:
-                # Simple heuristic: use position on field (left=team0, right=team1)
+            if classifier and len(player_crops) > 0:
+                team_ids = classifier.predict(player_crops)
+            elif len(player_crops) > 0:
                 anchors = players.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
                 frame_width = frame.shape[1]
                 team_ids = (anchors[:, 0] > frame_width / 2).astype(int)
@@ -186,6 +252,10 @@ def log_frames(
                 "image": None,
                 "pitch": None,
                 "confidence": None,
+                "velocity": None,
+                "speed": None,
+                "owner_id": None,
+                "owner_team": None,
             }
             if len(ball_det) > 0:
                 anchor = ball_det.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)[0]
@@ -197,37 +267,110 @@ def log_frames(
                         np.asarray([anchor], dtype=np.float32)
                     )[0]
                     ball_entry["pitch"] = pitch_xy.tolist()
+                    if last_ball_pitch is not None and last_ball_frame is not None:
+                        dt = frame_idx - last_ball_frame
+                        if dt > 0:
+                            velocity = (pitch_xy - last_ball_pitch) / dt
+                            speed = float(np.linalg.norm(velocity))
+                            ball_entry["velocity"] = velocity.tolist()
+                            ball_entry["speed"] = speed
+                            last_ball_speed = speed
+                    last_ball_pitch = pitch_xy
+                    last_ball_frame = frame_idx
 
-            def serialize_entities(det: sv.Detections, teams: np.ndarray) -> List[Dict[str, Any]]:
-                result: List[Dict[str, Any]] = []
-                if len(det) == 0:
-                    return result
-                anchors = det.get_anchors_coordinates(sv.Position.BOTTOM_CENTER).astype(np.float32)
-                pitch_pts = (
-                    transformer.transform_points(anchors) if transformer is not None else None
+            players_serialized = serialize_entities(players, team_ids, transformer)
+            goalkeepers_serialized = serialize_entities(goalkeepers, keeper_team, transformer)
+            referees_serialized = serialize_entities(referees, np.full(len(referees), fill_value=2), transformer)
+
+            owner_candidate = None
+            if ball_entry["pitch"] is not None:
+                owner_candidate = nearest_owner(
+                    np.array(ball_entry["pitch"], dtype=float),
+                    players_serialized + goalkeepers_serialized,
+                    radius_cm=450.0,
                 )
-                for idx, tid in enumerate(det.tracker_id):
-                    entry = {
-                        "id": int(tid) if tid is not None else None,
-                        "team": int(teams[idx]) if len(teams) > idx else 0,
-                        "confidence": float(det.confidence[idx]) if det.confidence is not None else None,
-                        "bbox": det.xyxy[idx].astype(float).tolist(),
-                        "image": anchors[idx].astype(float).tolist(),
-                        "pitch": pitch_pts[idx].astype(float).tolist() if pitch_pts is not None else None,
-                    }
-                    result.append(entry)
-                return result
+            if owner_candidate:
+                ball_entry["owner_id"] = owner_candidate["id"]
+                ball_entry["owner_team"] = owner_candidate["team"]
+                last_ball_owner = owner_candidate
+            elif last_ball_owner:
+                ball_entry["owner_team"] = last_ball_owner["team"]
+
+            if ball_entry["visible"]:
+            if active_gap is not None:
+                active_gap["end_frame"] = frame_idx
+                ball_gaps.append(active_gap)
+                active_gap = None
+            else:
+                should_track_gap = last_ball_speed > 0.5 or last_ball_owner is not None
+                if should_track_gap:
+                    if active_gap is None:
+                        active_gap = {"start_frame": frame_idx, "end_frame": frame_idx}
+                    else:
+                        active_gap["end_frame"] = frame_idx
+
+            # Draw annotations and save frames
+            annotated_frame = frame.copy()
+            
+            # Combine all entities for annotation
+            all_entities = sv.Detections.empty()
+            all_teams = np.array([], dtype=int)
+            all_labels = []
+            
+            if len(players) > 0:
+                all_entities = sv.Detections.merge([all_entities, players])
+                all_teams = np.concatenate([all_teams, team_ids])
+                for p in players_serialized:
+                    all_labels.append(f"P{p['id']} T{p['team']}")
+            
+            if len(goalkeepers) > 0:
+                all_entities = sv.Detections.merge([all_entities, goalkeepers])
+                all_teams = np.concatenate([all_teams, keeper_team])
+                for g in goalkeepers_serialized:
+                    all_labels.append(f"GK{g['id']} T{g['team']}")
+            
+            if len(ball_det) > 0:
+                all_entities = sv.Detections.merge([all_entities, ball_det])
+            
+            # Draw players and goalkeepers with ellipses
+            if len(players) > 0 or len(goalkeepers) > 0:
+                entity_detections = sv.Detections.merge([players, goalkeepers])
+                entity_teams = np.concatenate([team_ids, keeper_team]) if len(team_ids) > 0 or len(keeper_team) > 0 else np.array([], dtype=int)
+                if len(entity_teams) > 0:
+                    color_lookup = np.array([entity_teams[i] if i < len(entity_teams) else 0 for i in range(len(entity_detections))])
+                    annotated_frame = ELLIPSE_ANNOTATOR.annotate(annotated_frame, entity_detections, custom_color_lookup=color_lookup)
+                    if len(all_labels) > 0:
+                        labels = [all_labels[i] if i < len(all_labels) else "" for i in range(len(entity_detections))]
+                        annotated_frame = ELLIPSE_LABEL_ANNOTATOR.annotate(annotated_frame, entity_detections, labels=labels)
+            
+            # Draw ball with triangle
+            if len(ball_det) > 0:
+                annotated_frame = TRIANGLE_ANNOTATOR.annotate(annotated_frame, ball_det)
+            
+            # Save annotated frame
+            frame_filename = output_paths["frames_dir"] / f"frame_{frame_idx:06d}.jpg"
+            cv2.imwrite(str(frame_filename), annotated_frame)
+            
+            # Also save if ball is missing
+            if not ball_entry["visible"]:
+                missing_frame_filename = output_paths["missing_ball_dir"] / f"frame_{frame_idx:06d}.jpg"
+                cv2.imwrite(str(missing_frame_filename), annotated_frame)
 
             frame_record = {
                 "frame": frame_idx,
                 "timestamp": timestamp_str,
                 "ball": ball_entry,
-                "players": serialize_entities(players, team_ids),
-                "goalkeepers": serialize_entities(goalkeepers, keeper_team),
-                "referees": serialize_entities(referees, np.full(len(referees), fill_value=2)),
+                "players": players_serialized,
+                "goalkeepers": goalkeepers_serialized,
+                "referees": referees_serialized,
             }
             fp.write(json.dumps(frame_record) + "\n")
 
+    if active_gap is not None:
+        ball_gaps.append(active_gap)
+
+    output_paths["gaps"].write_text(json.dumps(ball_gaps, indent=2))
+    print(f"[telemetry] Ball gap windows -> {output_paths['gaps']}")
     print(f"[telemetry] Telemetry -> {output_paths['telemetry']}")
 
 
@@ -239,9 +382,12 @@ def main() -> None:
 
     paths = ensure_output_paths(video_path, Path(args.output_dir) if args.output_dir else None)
     models = load_models(device=args.device)
-    # Skip slow team classifier training - using simple position-based teams
-    classifier = None
-    print("[telemetry] Using fast position-based team assignment (skip classifier training)")
+    crops = collect_player_crops(models["player"], video_path, args.sample_stride)
+    classifier = fit_team_classifier(args.device, crops)
+    if classifier:
+        print("[telemetry] Team classifier trained.")
+    else:
+        print("[telemetry] Falling back to position-based team heuristic.")
 
     metadata = {
         "video": str(video_path),
@@ -251,6 +397,7 @@ def main() -> None:
         "pitch_model": PITCH_DETECTION_MODEL_PATH,
         "team_classifier_trained": classifier is not None,
         "stride": args.sample_stride,
+        "gap_file": str(paths["gaps"]),
     }
     write_metadata(paths["metadata"], metadata)
     log_frames(models, video_path, paths, args.device, classifier)

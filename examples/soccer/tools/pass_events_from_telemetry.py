@@ -34,6 +34,10 @@ class Event:
     distance_m: Optional[float]
     pass_type: str
     outcome: str  # successful | intercepted | lost
+    release_speed: Optional[float]
+    receive_speed: Optional[float]
+    release_recovered: bool
+    receive_recovered: bool
 
 
 def parse_args() -> argparse.Namespace:
@@ -46,9 +50,10 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional override for output location (defaults to telemetry directory).",
     )
-    parser.add_argument("--possession_radius_cm", type=float, default=600.0)
-    parser.add_argument("--min_possession_frames", type=int, default=2)
-    parser.add_argument("--pass_timeout_frames", type=int, default=50)
+    parser.add_argument("--base_possession_radius_cm", type=float, default=450.0)
+    parser.add_argument("--max_dynamic_radius_cm", type=float, default=900.0)
+    parser.add_argument("--min_possession_frames", type=int, default=3)
+    parser.add_argument("--pass_timeout_frames", type=int, default=35)
     return parser.parse_args()
 
 
@@ -117,13 +122,35 @@ def main() -> None:
         frame = entry["frame"]
         timestamp = entry["timestamp"]
         ball_pitch = entry["ball"].get("pitch")
+        ball_speed = entry["ball"].get("speed") or 0.0
+        ball_recovered = bool(entry["ball"].get("recovered", False))
+
+        dynamic_radius = min(
+            args.base_possession_radius_cm + ball_speed * 60.0,
+            args.max_dynamic_radius_cm,
+        )
+
         players = entry["players"] + entry.get("goalkeepers", [])
 
         owner_candidate = None
-        if ball_pitch is not None:
-            owner_candidate = nearest_owner(
-                np.array(ball_pitch, dtype=float), players, args.possession_radius_cm
+        owner_id = entry["ball"].get("owner_id")
+        owner_team = entry["ball"].get("owner_team")
+        if owner_id is not None and owner_team is not None and ball_pitch is not None:
+            owner_candidate = {
+                "id": owner_id,
+                "team": owner_team,
+                "pos": np.array(ball_pitch, dtype=float),
+                "speed": ball_speed,
+                "recovered": ball_recovered,
+            }
+        elif ball_pitch is not None:
+            nearest = nearest_owner(
+                np.array(ball_pitch, dtype=float), players, dynamic_radius
             )
+            if nearest:
+                nearest["speed"] = ball_speed
+                nearest["recovered"] = ball_recovered
+                owner_candidate = nearest
 
         if owner_candidate is not None:
             # Ball currently controlled by someone.
@@ -155,11 +182,15 @@ def main() -> None:
                             end_time=timestamp,
                             passer_id=current_owner["id"],
                             receiver_id=owner_candidate["id"],
-                            passer_team=f"Team {'A' if current_owner['team'] == 0 else 'B'}",
-                            receiver_team=f"Team {'A' if owner_candidate['team'] == 0 else 'B'}",
+                            passer_team=current_owner["team"],
+                            receiver_team=owner_candidate["team"],
                             distance_m=distance_m,
                             pass_type=classify_distance(distance_m),
                             outcome=outcome,
+                            release_speed=current_owner.get("speed"),
+                            receive_speed=owner_candidate.get("speed"),
+                            release_recovered=current_owner.get("recovered", False),
+                            receive_recovered=owner_candidate.get("recovered", False),
                         )
                     )
                 # Reset ownership
@@ -168,6 +199,8 @@ def main() -> None:
                     "team": owner_candidate["team"],
                     "last_frame": frame,
                     "last_time": timestamp,
+                    "speed": ball_speed,
+                    "recovered": ball_recovered,
                 }
                 owner_frames = 1
                 owner_last_pos = owner_candidate["pos"]
@@ -176,6 +209,8 @@ def main() -> None:
                 owner_frames += 1
                 current_owner["last_frame"] = frame
                 current_owner["last_time"] = timestamp
+                current_owner["speed"] = ball_speed
+                current_owner["recovered"] = ball_recovered or current_owner.get("recovered", False)
                 owner_last_pos = (
                     owner_candidate["pos"] if owner_candidate["pos"] is not None else owner_last_pos
                 )
@@ -192,11 +227,15 @@ def main() -> None:
                             end_time=timestamp,
                             passer_id=current_owner["id"],
                             receiver_id=None,
-                            passer_team=f"Team {'A' if current_owner['team'] == 0 else 'B'}",
+                            passer_team=current_owner["team"],
                             receiver_team=None,
                             distance_m=None,
                             pass_type="unknown",
                             outcome="lost",
+                            release_speed=current_owner.get("speed"),
+                            receive_speed=None,
+                            release_recovered=current_owner.get("recovered", False),
+                            receive_recovered=False,
                         )
                     )
                     current_owner = None
@@ -222,6 +261,10 @@ def main() -> None:
                     "distance_m",
                     "pass_type",
                     "outcome",
+                    "release_speed",
+                    "receive_speed",
+                    "release_recovered",
+                    "receive_recovered",
                 ]
             )
             for ev in events:
@@ -238,6 +281,10 @@ def main() -> None:
                         f"{ev.distance_m:.2f}" if ev.distance_m is not None else "",
                         ev.pass_type,
                         ev.outcome,
+                        f"{ev.release_speed:.3f}" if ev.release_speed is not None else "",
+                        f"{ev.receive_speed:.3f}" if ev.receive_speed is not None else "",
+                        int(ev.release_recovered),
+                        int(ev.receive_recovered),
                     ]
                 )
         json_path.write_text(json.dumps([ev.__dict__ for ev in events], indent=2))

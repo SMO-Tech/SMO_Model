@@ -116,43 +116,56 @@ Because the real-time demo is intentionally lightweight, we provide standalone
 tools under `examples/soccer/tools/` to generate richer visualisations
 without altering `main.py`.
 
-### Telemetry logging
+1. **Telemetry logging**
 
-```
-cd examples/soccer
-python tools/telemetry_logger.py \
-  --source_video_path data/0bfacc_0.mp4 \
-  --device cpu
-```
+   ```
+   cd examples/soccer
+   python tools/telemetry_logger.py \
+     --source_video_path data/0bfacc_0.mp4 \
+     --device cpu
+   ```
 
-This command reuses the YOLO + ByteTrack + team-classifier pipeline to emit a
-frame-by-frame log (`analysis/<video>/telemetry.jsonl`) and a companion
-`metadata.json`. Each record contains:
+   Produces `analysis/<video>/telemetry.jsonl`, `metadata.json`, and
+   `ball_gap_windows.json` (the frames where the ball went missing).
 
-- Tracker IDs for players/goalkeepers/referees
-- Team assignments (0/1) inferred from SigLIP → UMAP → KMeans
-- Image-space + pitch-space coordinates
-- Ball visibility, position and confidence
+2. **Gap refinement (optional but recommended)**
 
-### Control map & smoothed ball trajectory (point 7 & 8)
+   ```
+   python tools/refine_ball_tracks.py \
+     --video_path data/0bfacc_0.mp4 \
+     --telemetry_path analysis/0bfacc_0/telemetry.jsonl \
+     --metadata_path analysis/0bfacc_0/metadata.json \
+     --gaps_path analysis/0bfacc_0/ball_gap_windows.json \
+     --output_path analysis/0bfacc_0/telemetry_refined.jsonl
+   ```
 
-```
-python tools/control_map_visualizer.py \
-  --telemetry_path analysis/0bfacc_0/telemetry.jsonl \
-  --metadata_path analysis/0bfacc_0/metadata.json \
-  --video_path data/0bfacc_0.mp4
-```
+   Re-runs ball detection only on the missing windows and patches the telemetry.
 
-Outputs `analysis/<video>/enhanced_control_map.avi` featuring:
+3. **Pass CSV / JSON**
 
-- Voronoi-style team dominance heatmaps (grid-based nearest-player control)
-- Player markers per team, drawn on a radar/pitch inset
-- Smoothed ball trajectory (configurable moving-average window) with trail
-- Graceful handling of missing detections (reuse last-known coordinates)
-- Blended overlay into the broadcast feed (bottom-right picture-in-picture)
+   ```
+   python tools/pass_events_from_telemetry.py \
+     --telemetry_path analysis/0bfacc_0/telemetry_refined.jsonl \
+     --metadata_path analysis/0bfacc_0/metadata.json \
+     --output_dir analysis/0bfacc_0
+   ```
 
-Because both steps run offline, you can iterate on analytics (pass timelines,
-possession charts, etc.) without touching the core demo.
+   Emits `passes_from_telemetry.csv` with kick/receive timestamps, player IDs,
+   teams, distance (short/medium/long), success vs interception vs lost, and
+   flags showing whether a recovered frame was used.
+
+4. **Control map & smoothed ball trajectory**
+
+   ```
+   python tools/control_map_visualizer.py \
+     --telemetry_path analysis/0bfacc_0/telemetry_refined.jsonl \
+     --metadata_path analysis/0bfacc_0/metadata.json \
+     --video_path data/0bfacc_0.mp4
+   ```
+
+   Produces `analysis/<video>/enhanced_control_map.avi` with Voronoi-style team
+   control overlay, player markers, smoothed ball trail, and a PIP-like blended
+   inset—ideal for reviewing analytics before sharing with customers.
 
 ## 🗺️ roadmap
 
