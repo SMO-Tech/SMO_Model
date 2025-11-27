@@ -15,12 +15,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import cv2
 import numpy as np
+import pytesseract
 import supervision as sv
 from tqdm import tqdm
 from ultralytics import YOLO
@@ -50,6 +52,7 @@ from main import (  # type: ignore
     get_crops,
     resolve_goalkeepers_team_id,
 )
+from tools.lineup_loader import RosterEntry, load_lineup_csv, roster_to_lookup
 
 
 def parse_args() -> argparse.Namespace:
@@ -67,6 +70,10 @@ def parse_args() -> argparse.Namespace:
         default=STRIDE,
         help="Stride for collecting player crops (team classifier fitting).",
     )
+    parser.add_argument("--home_lineup_path", type=str, default=None, help="CSV from lineup extractor for the home team.")
+    parser.add_argument("--away_lineup_path", type=str, default=None, help="CSV from lineup extractor for the away team.")
+    parser.add_argument("--home_team_name", type=str, default="Home", help="Name used for home team metadata.")
+    parser.add_argument("--away_team_name", type=str, default="Away", help="Name used for away team metadata.")
     return parser.parse_args()
 
 
@@ -175,6 +182,69 @@ def serialize_entities(
     return result
 
 
+def extract_jersey_digits(crop: np.ndarray) -> Optional[str]:
+    if crop.size == 0:
+        return None
+    h = crop.shape[0]
+    if h < 10:
+        return None
+    focus = crop[int(h * 0.3) :, :]
+    gray = cv2.cvtColor(focus, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    _, thresh = cv2.threshold(
+        blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    )
+    config = "--psm 7 --oem 3 -c tessedit_char_whitelist=0123456789"
+    text = pytesseract.image_to_string(thresh, config=config)
+    digits = re.sub(r"[^0-9]", "", text)
+    if 1 <= len(digits) <= 2:
+        return digits
+    return None
+
+
+def update_jersey_memory(
+    detections: sv.Detections,
+    crops: List[np.ndarray],
+    memory: Dict[int, str],
+) -> None:
+    if len(detections) == 0 or detections.tracker_id is None:
+        return
+    for idx, crop in enumerate(crops):
+        if idx >= len(detections):
+            break
+        tracker_id = detections.tracker_id[idx]
+        if tracker_id is None or tracker_id in memory:
+            continue
+        jersey = extract_jersey_digits(crop)
+        if jersey:
+            memory[int(tracker_id)] = jersey
+
+
+def enrich_entities_with_roster(
+    entities: List[Dict[str, Any]],
+    jersey_memory: Dict[int, str],
+    rosters: Optional[Dict[int, Dict[str, Dict[str, Optional[str]]]]],
+) -> None:
+    if not entities:
+        return
+    for entry in entities:
+        tracker_id = entry.get("id")
+        if tracker_id is None:
+            continue
+        jersey = jersey_memory.get(int(tracker_id))
+        if jersey:
+            entry["jersey_number"] = jersey
+            if rosters:
+                team = entry.get("team")
+                if team is not None:
+                    team_lookup = rosters.get(int(team))
+                    if team_lookup:
+                        roster_hit = team_lookup.get(jersey)
+                        if roster_hit:
+                            entry["player_name"] = roster_hit.get("player_name")
+                            entry["team_name"] = roster_hit.get("team_name")
+
+
 def write_metadata(path: Path, info: Dict[str, Any]) -> None:
     path.write_text(json.dumps(info, indent=2))
     print(f"[telemetry] Metadata -> {path}")
@@ -186,6 +256,7 @@ def log_frames(
     output_paths: Dict[str, Path],
     device: str,
     classifier: Optional[TeamClassifier],
+    rosters: Optional[Dict[int, Dict[str, Dict[str, Optional[str]]]]] = None,
 ) -> None:
     video_info = sv.VideoInfo.from_video_path(str(video_path))
     frame_generator = sv.get_video_frames_generator(str(video_path))
@@ -199,6 +270,7 @@ def log_frames(
     last_ball_speed: float = 0.0
     ball_gaps: List[Dict[str, int]] = []
     active_gap: Optional[Dict[str, int]] = None
+    jersey_memory: Dict[int, str] = {}
 
     with output_paths["telemetry"].open("w") as fp, tqdm(
         frame_generator, total=video_info.total_frames, desc="logging", unit="frame"
@@ -226,7 +298,8 @@ def log_frames(
             goalkeepers = detections[detections.class_id == GOALKEEPER_CLASS_ID]
             referees = detections[detections.class_id == REFEREE_CLASS_ID]
 
-            player_crops = get_crops(frame, players)
+            player_crops = get_crops(frame, players) if len(players) > 0 else []
+            update_jersey_memory(players, player_crops, jersey_memory)
             if classifier and len(player_crops) > 0:
                 team_ids = classifier.predict(player_crops)
             elif len(player_crops) > 0:
@@ -235,6 +308,9 @@ def log_frames(
                 team_ids = (anchors[:, 0] > frame_width / 2).astype(int)
             else:
                 team_ids = np.array([], dtype=int)
+
+            goalkeeper_crops = get_crops(frame, goalkeepers) if len(goalkeepers) > 0 else []
+            update_jersey_memory(goalkeepers, goalkeeper_crops, jersey_memory)
 
             if len(goalkeepers) > 0 and len(players) > 0:
                 keeper_team = resolve_goalkeepers_team_id(players, team_ids, goalkeepers)
@@ -281,6 +357,9 @@ def log_frames(
             players_serialized = serialize_entities(players, team_ids, transformer)
             goalkeepers_serialized = serialize_entities(goalkeepers, keeper_team, transformer)
             referees_serialized = serialize_entities(referees, np.full(len(referees), fill_value=2), transformer)
+
+            enrich_entities_with_roster(players_serialized, jersey_memory, rosters)
+            enrich_entities_with_roster(goalkeepers_serialized, jersey_memory, rosters)
 
             owner_candidate = None
             if ball_entry["pitch"] is not None:
@@ -389,6 +468,19 @@ def main() -> None:
     else:
         print("[telemetry] Falling back to position-based team heuristic.")
 
+    roster_entries: Dict[str, List[RosterEntry]] = {}
+    roster_lookups: Dict[int, Dict[str, Dict[str, Optional[str]]]] = {}
+    if args.home_lineup_path:
+        home_entries = load_lineup_csv(Path(args.home_lineup_path), args.home_team_name, team_id=0)
+        roster_entries["home"] = home_entries
+        roster_lookups[0] = roster_to_lookup(home_entries)
+        print(f"[telemetry] Loaded {len(home_entries)} home lineup entries.")
+    if args.away_lineup_path:
+        away_entries = load_lineup_csv(Path(args.away_lineup_path), args.away_team_name, team_id=1)
+        roster_entries["away"] = away_entries
+        roster_lookups[1] = roster_to_lookup(away_entries)
+        print(f"[telemetry] Loaded {len(away_entries)} away lineup entries.")
+
     metadata = {
         "video": str(video_path),
         "fps": sv.VideoInfo.from_video_path(str(video_path)).fps,
@@ -398,9 +490,13 @@ def main() -> None:
         "team_classifier_trained": classifier is not None,
         "stride": args.sample_stride,
         "gap_file": str(paths["gaps"]),
+        "lineups": {
+            team: [entry.to_dict() for entry in entries]
+            for team, entries in roster_entries.items()
+        },
     }
     write_metadata(paths["metadata"], metadata)
-    log_frames(models, video_path, paths, args.device, classifier)
+    log_frames(models, video_path, paths, args.device, classifier, roster_lookups)
 
 
 if __name__ == "__main__":

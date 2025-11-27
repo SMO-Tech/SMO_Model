@@ -3,7 +3,7 @@ import csv
 import json
 import os
 from enum import Enum
-from typing import Any, Dict, Iterator, List, Optional, Set
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 import cv2
 import numpy as np
 import supervision as sv

@@ -16,7 +16,7 @@ import csv
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -31,6 +31,12 @@ class Event:
     receiver_id: Optional[int]
     passer_team: Optional[int]
     receiver_team: Optional[int]
+    passer_name: Optional[str]
+    receiver_name: Optional[str]
+    passer_jersey: Optional[str]
+    receiver_jersey: Optional[str]
+    passer_team_name: Optional[str]
+    receiver_team_name: Optional[str]
     distance_m: Optional[float]
     pass_type: str
     outcome: str  # successful | intercepted | lost
@@ -96,6 +102,25 @@ def classify_distance(distance_m: Optional[float]) -> str:
     return "long"
 
 
+def attach_identity(
+    owner: dict,
+    tracker_identity: Dict[int, Dict[str, Any]],
+    team_labels: Dict[int, str],
+) -> None:
+    owner_id = owner.get("id")
+    if owner_id is None:
+        return
+    identity = tracker_identity.get(int(owner_id))
+    if identity:
+        for key in ("team", "jersey_number", "player_name", "team_name"):
+            value = identity.get(key)
+            if value is not None:
+                owner[key] = value
+    team = owner.get("team")
+    if team is not None and owner.get("team_name") is None:
+        owner["team_name"] = team_labels.get(int(team), f"Team {team}")
+
+
 def main() -> None:
     args = parse_args()
     tele_path = Path(args.telemetry_path)
@@ -111,12 +136,23 @@ def main() -> None:
     csv_path = output_dir / "passes_from_telemetry.csv"
     json_path = output_dir / "passes_from_telemetry.json"
 
+    team_labels: Dict[int, str] = {}
+    for lineup_entries in metadata.get("lineups", {}).values():
+        for entry in lineup_entries:
+            team_id = entry.get("team_id")
+            team_name = entry.get("team_name")
+            if team_id is not None and team_name:
+                team_labels[int(team_id)] = str(team_name)
+    if not team_labels:
+        team_labels = {0: "Team 0", 1: "Team 1"}
+
     current_owner: Optional[dict] = None
     owner_frames = 0
     owner_last_pos: Optional[np.ndarray] = None
     pending_no_owner = 0
 
     events: List[Event] = []
+    tracker_identity: Dict[int, Dict[str, Any]] = {}
 
     for entry in telemetry:
         frame = entry["frame"]
@@ -131,6 +167,19 @@ def main() -> None:
         )
 
         players = entry["players"] + entry.get("goalkeepers", [])
+        for pl in players:
+            pid = pl.get("id")
+            if pid is None:
+                continue
+            pid_int = int(pid)
+            identity = tracker_identity.setdefault(pid_int, {})
+            team_val = pl.get("team")
+            if team_val is not None:
+                identity["team"] = int(team_val)
+            for key in ("jersey_number", "player_name", "team_name"):
+                value = pl.get(key)
+                if value:
+                    identity[key] = value
 
         owner_candidate = None
         owner_id = entry["ball"].get("owner_id")
@@ -153,6 +202,7 @@ def main() -> None:
                 owner_candidate = nearest
 
         if owner_candidate is not None:
+            attach_identity(owner_candidate, tracker_identity, team_labels)
             # Ball currently controlled by someone.
             pending_no_owner = 0
             if (
@@ -174,6 +224,14 @@ def main() -> None:
                         if owner_candidate["team"] == current_owner["team"]
                         else "intercepted"
                     )
+                    passer_team_name = current_owner.get("team_name") or team_labels.get(
+                        int(current_owner["team"]) if current_owner.get("team") is not None else 0,
+                        None,
+                    )
+                    receiver_team_name = owner_candidate.get("team_name") or team_labels.get(
+                        int(owner_candidate["team"]) if owner_candidate.get("team") is not None else 0,
+                        None,
+                    )
                     events.append(
                         Event(
                             start_frame=current_owner["last_frame"],
@@ -184,6 +242,12 @@ def main() -> None:
                             receiver_id=owner_candidate["id"],
                             passer_team=current_owner["team"],
                             receiver_team=owner_candidate["team"],
+                            passer_name=current_owner.get("player_name"),
+                            receiver_name=owner_candidate.get("player_name"),
+                            passer_jersey=current_owner.get("jersey_number"),
+                            receiver_jersey=owner_candidate.get("jersey_number"),
+                            passer_team_name=passer_team_name,
+                            receiver_team_name=receiver_team_name,
                             distance_m=distance_m,
                             pass_type=classify_distance(distance_m),
                             outcome=outcome,
@@ -201,6 +265,14 @@ def main() -> None:
                     "last_time": timestamp,
                     "speed": ball_speed,
                     "recovered": ball_recovered,
+                    "player_name": owner_candidate.get("player_name"),
+                    "jersey_number": owner_candidate.get("jersey_number"),
+                    "team_name": owner_candidate.get("team_name")
+                    or team_labels.get(
+                        int(owner_candidate["team"])
+                        if owner_candidate.get("team") is not None
+                        else 0
+                    ),
                 }
                 owner_frames = 1
                 owner_last_pos = owner_candidate["pos"]
@@ -211,6 +283,12 @@ def main() -> None:
                 current_owner["last_time"] = timestamp
                 current_owner["speed"] = ball_speed
                 current_owner["recovered"] = ball_recovered or current_owner.get("recovered", False)
+                for key in ("player_name", "jersey_number", "team_name"):
+                    value = owner_candidate.get(key)
+                    if value:
+                        current_owner[key] = value
+                if current_owner.get("team_name") is None and current_owner.get("team") is not None:
+                    current_owner["team_name"] = team_labels.get(int(current_owner["team"]))
                 owner_last_pos = (
                     owner_candidate["pos"] if owner_candidate["pos"] is not None else owner_last_pos
                 )
@@ -219,6 +297,10 @@ def main() -> None:
             if current_owner is not None:
                 pending_no_owner += 1
                 if pending_no_owner >= args.pass_timeout_frames:
+                    passer_team_name = current_owner.get("team_name") or team_labels.get(
+                        int(current_owner["team"]) if current_owner.get("team") is not None else 0,
+                        None,
+                    )
                     events.append(
                         Event(
                             start_frame=current_owner["last_frame"],
@@ -229,6 +311,12 @@ def main() -> None:
                             receiver_id=None,
                             passer_team=current_owner["team"],
                             receiver_team=None,
+                            passer_name=current_owner.get("player_name"),
+                            receiver_name=None,
+                            passer_jersey=current_owner.get("jersey_number"),
+                            receiver_jersey=None,
+                            passer_team_name=passer_team_name,
+                            receiver_team_name=None,
                             distance_m=None,
                             pass_type="unknown",
                             outcome="lost",
@@ -255,9 +343,15 @@ def main() -> None:
                     "start_frame",
                     "end_frame",
                     "passer_id",
+                    "passer_name",
+                    "passer_jersey",
                     "receiver_id",
+                    "receiver_name",
+                    "receiver_jersey",
                     "passer_team",
+                    "passer_team_name",
                     "receiver_team",
+                    "receiver_team_name",
                     "distance_m",
                     "pass_type",
                     "outcome",
@@ -275,9 +369,15 @@ def main() -> None:
                         ev.start_frame,
                         ev.end_frame,
                         ev.passer_id,
+                        ev.passer_name or "",
+                        ev.passer_jersey or "",
                         ev.receiver_id,
+                        ev.receiver_name or "",
+                        ev.receiver_jersey or "",
                         ev.passer_team,
+                        ev.passer_team_name or "",
                         ev.receiver_team,
+                        ev.receiver_team_name or "",
                         f"{ev.distance_m:.2f}" if ev.distance_m is not None else "",
                         ev.pass_type,
                         ev.outcome,
