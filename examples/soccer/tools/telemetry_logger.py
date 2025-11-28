@@ -46,7 +46,6 @@ from main import (  # type: ignore
     PITCH_DETECTION_MODEL_PATH,
     REFEREE_CLASS_ID,
     STRIDE,
-    TRIANGLE_ANNOTATOR,
     get_crops,
     resolve_goalkeepers_team_id,
 )
@@ -74,7 +73,8 @@ def ensure_output_paths(video_path: Path, output_dir: Optional[Path]) -> Dict[st
     if output_dir is None:
         base_dir = video_path.parent / "analysis" / video_path.stem
     else:
-        base_dir = Path(output_dir)
+        # Always nest under video stem for consistency
+        base_dir = Path(output_dir) / video_path.stem
     base_dir.mkdir(parents=True, exist_ok=True)
     frames_dir = base_dir / "frames_with_detections"
     frames_dir.mkdir(exist_ok=True)
@@ -191,7 +191,7 @@ def log_frames(
     frame_generator = sv.get_video_frames_generator(str(video_path))
 
     tracker = sv.ByteTrack(minimum_consecutive_frames=3)
-    ball_tracker = BallTracker(buffer_size=15)
+    ball_tracker = BallTracker(buffer_size=20)
     transformer: Optional[ViewTransformer] = None
     last_ball_pitch: Optional[np.ndarray] = None
     last_ball_frame: Optional[int] = None
@@ -242,7 +242,7 @@ def log_frames(
                 keeper_team = np.zeros(len(goalkeepers), dtype=int)
 
             # Ball detection/smoothing (optimized - no slicer, direct detection)
-            ball_res = models["ball"](frame, imgsz=640, verbose=False, device=device)[0]
+            ball_res = models["ball"](frame, imgsz=640, conf=0.10, verbose=False, device=device)[0]
             ball_det = sv.Detections.from_ultralytics(ball_res)
             ball_det = ball_det[ball_det.class_id == BALL_CLASS_ID]
             ball_det = ball_tracker.update(ball_det)
@@ -297,10 +297,10 @@ def log_frames(
                 ball_entry["owner_team"] = last_ball_owner["team"]
 
             if ball_entry["visible"]:
-            if active_gap is not None:
-                active_gap["end_frame"] = frame_idx
-                ball_gaps.append(active_gap)
-                active_gap = None
+                if active_gap is not None:
+                    active_gap["end_frame"] = frame_idx
+                    ball_gaps.append(active_gap)
+                    active_gap = None
             else:
                 should_track_gap = last_ball_speed > 0.5 or last_ball_owner is not None
                 if should_track_gap:
@@ -312,40 +312,47 @@ def log_frames(
             # Draw annotations and save frames
             annotated_frame = frame.copy()
             
-            # Combine all entities for annotation
-            all_entities = sv.Detections.empty()
-            all_teams = np.array([], dtype=int)
+            # Build labels for players and goalkeepers
             all_labels = []
+            for p in players_serialized:
+                all_labels.append(f"P{p['id']} T{p['team']}")
+            for g in goalkeepers_serialized:
+                all_labels.append(f"GK{g['id']} T{g['team']}")
             
+            # Draw players and goalkeepers with ellipses (team-colored)
+            # Use per-entity annotation to avoid supervision's custom_color_lookup issue
+            TEAM0_COLOR = sv.Color.from_hex('#FF1493')  # Pink
+            TEAM1_COLOR = sv.Color.from_hex('#00BFFF')  # Blue
+            
+            label_idx = 0
             if len(players) > 0:
-                all_entities = sv.Detections.merge([all_entities, players])
-                all_teams = np.concatenate([all_teams, team_ids])
-                for p in players_serialized:
-                    all_labels.append(f"P{p['id']} T{p['team']}")
+                for i in range(len(players)):
+                    det_slice = players[[i]]
+                    team = team_ids[i] if i < len(team_ids) else 0
+                    color = TEAM0_COLOR if team == 0 else TEAM1_COLOR
+                    ellipse_ann = sv.EllipseAnnotator(color=color, thickness=2)
+                    label_ann = sv.LabelAnnotator(color=color, text_color=sv.Color.WHITE, text_position=sv.Position.BOTTOM_CENTER)
+                    annotated_frame = ellipse_ann.annotate(annotated_frame, det_slice)
+                    label = all_labels[label_idx] if label_idx < len(all_labels) else ""
+                    annotated_frame = label_ann.annotate(annotated_frame, det_slice, labels=[label])
+                    label_idx += 1
             
             if len(goalkeepers) > 0:
-                all_entities = sv.Detections.merge([all_entities, goalkeepers])
-                all_teams = np.concatenate([all_teams, keeper_team])
-                for g in goalkeepers_serialized:
-                    all_labels.append(f"GK{g['id']} T{g['team']}")
+                for i in range(len(goalkeepers)):
+                    det_slice = goalkeepers[[i]]
+                    team = keeper_team[i] if i < len(keeper_team) else 0
+                    color = TEAM0_COLOR if team == 0 else TEAM1_COLOR
+                    ellipse_ann = sv.EllipseAnnotator(color=color, thickness=3)
+                    label_ann = sv.LabelAnnotator(color=sv.Color.from_hex('#FFD700'), text_color=sv.Color.BLACK, text_position=sv.Position.BOTTOM_CENTER)
+                    annotated_frame = ellipse_ann.annotate(annotated_frame, det_slice)
+                    label = all_labels[label_idx] if label_idx < len(all_labels) else "GK"
+                    annotated_frame = label_ann.annotate(annotated_frame, det_slice, labels=[label])
+                    label_idx += 1
             
+            # Draw ball with bounding box
             if len(ball_det) > 0:
-                all_entities = sv.Detections.merge([all_entities, ball_det])
-            
-            # Draw players and goalkeepers with ellipses
-            if len(players) > 0 or len(goalkeepers) > 0:
-                entity_detections = sv.Detections.merge([players, goalkeepers])
-                entity_teams = np.concatenate([team_ids, keeper_team]) if len(team_ids) > 0 or len(keeper_team) > 0 else np.array([], dtype=int)
-                if len(entity_teams) > 0:
-                    color_lookup = np.array([entity_teams[i] if i < len(entity_teams) else 0 for i in range(len(entity_detections))])
-                    annotated_frame = ELLIPSE_ANNOTATOR.annotate(annotated_frame, entity_detections, custom_color_lookup=color_lookup)
-                    if len(all_labels) > 0:
-                        labels = [all_labels[i] if i < len(all_labels) else "" for i in range(len(entity_detections))]
-                        annotated_frame = ELLIPSE_LABEL_ANNOTATOR.annotate(annotated_frame, entity_detections, labels=labels)
-            
-            # Draw ball with triangle
-            if len(ball_det) > 0:
-                annotated_frame = TRIANGLE_ANNOTATOR.annotate(annotated_frame, ball_det)
+                ball_box_ann = sv.BoxAnnotator(color=sv.Color.from_hex('#FF1493'), thickness=2)
+                annotated_frame = ball_box_ann.annotate(annotated_frame, ball_det)
             
             # Save annotated frame
             frame_filename = output_paths["frames_dir"] / f"frame_{frame_idx:06d}.jpg"
@@ -372,6 +379,55 @@ def log_frames(
     output_paths["gaps"].write_text(json.dumps(ball_gaps, indent=2))
     print(f"[telemetry] Ball gap windows -> {output_paths['gaps']}")
     print(f"[telemetry] Telemetry -> {output_paths['telemetry']}")
+
+
+def interpolate_ball_positions(telemetry_path: Path, max_gap: int = 10) -> int:
+    """
+    Linearly interpolate missing ball positions for short gaps.
+    Returns the number of frames that were interpolated.
+    """
+    with open(telemetry_path, 'r') as f:
+        records = [json.loads(line) for line in f]
+    
+    interpolated_count = 0
+    i = 0
+    while i < len(records):
+        if records[i]["ball"]["visible"]:
+            # Found a visible ball, look ahead for the next visible one
+            start_idx = i
+            start_pos = np.array(records[i]["ball"]["pitch"])
+            
+            # Find the next visible ball
+            j = i + 1
+            while j < len(records) and not records[j]["ball"]["visible"]:
+                j += 1
+            
+            if j < len(records) and (j - i) <= max_gap:
+                # Found another visible ball within max_gap frames
+                end_pos = np.array(records[j]["ball"]["pitch"])
+                gap_size = j - i
+                
+                # Interpolate positions in between
+                for k in range(1, gap_size):
+                    alpha = k / gap_size
+                    interp_pos = start_pos + alpha * (end_pos - start_pos)
+                    records[i + k]["ball"]["pitch"] = interp_pos.tolist()
+                    records[i + k]["ball"]["visible"] = True
+                    records[i + k]["ball"]["interpolated"] = True
+                    interpolated_count += 1
+                
+                i = j
+            else:
+                i += 1
+        else:
+            i += 1
+    
+    # Write back
+    with open(telemetry_path, 'w') as f:
+        for record in records:
+            f.write(json.dumps(record) + '\n')
+    
+    return interpolated_count
 
 
 def main() -> None:
@@ -401,6 +457,10 @@ def main() -> None:
     }
     write_metadata(paths["metadata"], metadata)
     log_frames(models, video_path, paths, args.device, classifier)
+    
+    # Interpolate short ball gaps for smoother tracking
+    interpolated = interpolate_ball_positions(paths["telemetry"], max_gap=10)
+    print(f"[telemetry] Interpolated ball positions for {interpolated} frames")
 
 
 if __name__ == "__main__":

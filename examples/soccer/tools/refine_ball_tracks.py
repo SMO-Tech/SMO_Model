@@ -51,7 +51,7 @@ def parse_args() -> argparse.Namespace:
         help="Optional output telemetry path (defaults to *_refined.jsonl).",
     )
     parser.add_argument("--padding", type=int, default=3, help="Frames to extend around each gap.")
-    parser.add_argument("--ball_conf", type=float, default=0.15, help="Confidence threshold for rerun.")
+    parser.add_argument("--ball_conf", type=float, default=0.05, help="Confidence threshold for rerun.")
     parser.add_argument(
         "--save_recovered_frames",
         action="store_true",
