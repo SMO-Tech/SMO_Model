@@ -29,17 +29,88 @@ except ImportError:
 
 
 def download_video(url: str, output_path: str) -> str:
-    """Download video from URL"""
+    """Download video from URL (supports YouTube, Google Drive, and direct URLs)"""
     try:
+        # Check if it's a YouTube URL
+        if 'youtube.com' in url or 'youtu.be' in url:
+            return download_youtube_video(url, output_path)
+        
+        # Check if it's a Google Drive URL
         import gdown
         if 'drive.google.com' in url:
             gdown.download(url, output_path, fuzzy=True)
-        else:
-            import urllib.request
-            urllib.request.urlretrieve(url, output_path)
+            return output_path
+        
+        # Direct URL download
+        import urllib.request
+        urllib.request.urlretrieve(url, output_path)
         return output_path
     except Exception as e:
         raise Exception(f"Failed to download video: {e}")
+
+
+def download_youtube_video(url: str, output_path: str) -> str:
+    """Download video from YouTube using yt-dlp"""
+    try:
+        import yt_dlp
+        
+        # Configure yt-dlp options
+        ydl_opts = {
+            'format': 'best[ext=mp4]/best',  # Prefer mp4 format
+            'outtmpl': output_path,
+            'quiet': False,
+            'no_warnings': False,
+            'extract_flat': False,
+        }
+        
+        print(f"📥 Downloading YouTube video: {url}")
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+        
+        # yt-dlp might add extension, check if file exists
+        if not Path(output_path).exists():
+            # Try with .mp4 extension
+            mp4_path = output_path + '.mp4'
+            if Path(mp4_path).exists():
+                import shutil
+                shutil.move(mp4_path, output_path)
+        
+        if Path(output_path).exists():
+            print(f"✅ YouTube video downloaded: {output_path}")
+            return output_path
+        else:
+            raise Exception("Downloaded file not found")
+            
+    except ImportError:
+        # Fallback to pytube if yt-dlp not available
+        try:
+            from pytube import YouTube
+            print(f"📥 Downloading YouTube video (pytube): {url}")
+            yt = YouTube(url)
+            stream = yt.streams.filter(progressive=True, file_extension='mp4').order_by('resolution').desc().first()
+            if stream:
+                stream.download(filename=output_path)
+                print(f"✅ YouTube video downloaded: {output_path}")
+                return output_path
+            else:
+                raise Exception("No suitable video stream found")
+        except ImportError:
+            raise Exception("Neither yt-dlp nor pytube is installed. Install with: pip install yt-dlp")
+    except Exception as e:
+        raise Exception(f"Failed to download YouTube video: {e}")
+
+
+def cleanup_video(video_path: Path) -> bool:
+    """Delete video file after processing"""
+    try:
+        if video_path.exists():
+            video_path.unlink()
+            print(f"🗑️  Deleted video: {video_path}")
+            return True
+        return False
+    except Exception as e:
+        print(f"⚠️  Could not delete video: {e}")
+        return False
 
 
 def ensure_models():
@@ -80,17 +151,27 @@ def handler(event):
     Expected input format:
     {
         "input": {
-            "video_url": "https://...",  # or "video_path": "/path/to/video.mp4"
+            "video_url": "https://youtube.com/watch?v=...",  # YouTube, Google Drive, or direct URL
+            "video_path": "/path/to/video.mp4",  # OR local path (use one or the other)
             "device": "cuda",  # optional, default: "cuda"
             "output_dir": "/path/to/output",  # optional
-            "match_id": "5ff7800c-e9ea-4962-a0d6-035ffe59de3c",  # required for API status updates
+            "match_id": "5ff7800c-e9ea-4962-a0d6-035ffe59de3c",  # Match/request ID for API status
             "api_base_url": "http://api.scoutme.cloud",  # optional: API base URL
-            "api_url": "https://api.example.com/api/passes",  # optional: API endpoint to send JSON data
-            "api_headers": {"Authorization": "Bearer token"},  # optional: custom headers for API
-            "video_id": "video_123"  # optional: video identifier for API
+            "api_url": "https://api.example.com/api/passes",  # optional: endpoint to send pass data
+            "api_headers": {"Authorization": "Bearer token"},  # optional: custom headers
+            "video_id": "video_123",  # optional: video identifier for API
+            "cleanup": true  # optional: delete video after processing (default: true for URLs)
         }
     }
+    
+    Supports:
+    - YouTube URLs (youtube.com, youtu.be)
+    - Google Drive URLs
+    - Direct video URLs
+    - Local file paths
     """
+    downloaded_video_path = None  # Track if we downloaded a video for cleanup
+    
     try:
         # Parse input
         input_data = event.get('input', {})
@@ -103,6 +184,7 @@ def handler(event):
         api_url = input_data.get('api_url')  # Optional API endpoint for pass data
         api_headers = input_data.get('api_headers')  # Optional API headers
         video_id = input_data.get('video_id')  # Optional video ID
+        cleanup = input_data.get('cleanup', True)  # Cleanup downloaded videos by default
         
         # Step 0: Update match status to "processing" if match_id provided
         if match_id:
@@ -121,9 +203,16 @@ def handler(event):
         
         # Get video file
         if video_url:
-            video_path = '/tmp/input_video.mp4'
-            print(f"Downloading video from {video_url}...")
+            # Generate unique filename for downloaded video
+            import time
+            timestamp = int(time.time())
+            video_filename = f"video_{match_id or timestamp}.mp4"
+            video_path = f'/tmp/{video_filename}'
+            
+            print(f"📥 Downloading video from {video_url}...")
             download_video(video_url, video_path)
+            downloaded_video_path = Path(video_path)  # Mark for cleanup
+            
         elif not video_path:
             return {
                 "error": "Either 'video_url' or 'video_path' must be provided"
@@ -307,7 +396,7 @@ def handler(event):
         
         # Step 5: Update match status to "completed" if match_id provided
         if match_id:
-            print(f"Step 5: Updating match status to 'completed'...")
+            print(f"Step 5: Updating match status to 'COMPLETED'...")
             status_result = update_match_status(
                 match_id=match_id,
                 status="COMPLETED",
@@ -315,9 +404,17 @@ def handler(event):
                 headers=api_headers
             )
             if status_result.get("success"):
-                results["match_status"] = "completed"
+                results["match_status"] = "COMPLETED"
             else:
                 results["match_status_error"] = status_result.get("error")
+        
+        # Step 6: Cleanup - delete downloaded video if requested
+        if cleanup and downloaded_video_path:
+            print(f"Step 6: Cleaning up downloaded video...")
+            if cleanup_video(downloaded_video_path):
+                results["video_cleaned"] = True
+            else:
+                results["video_cleaned"] = False
         
         return results
         
@@ -327,17 +424,24 @@ def handler(event):
         print(f"ERROR: {error_msg}")
         print(traceback_str)
         
-        # Update match status to "failed" if match_id was provided
+        # Update match status to "FAILED" if match_id was provided
         if 'match_id' in locals() and match_id:
             try:
                 update_match_status(
                     match_id=match_id,
-                    status="failed",
+                    status="FAILED",
                     base_url=api_base_url if 'api_base_url' in locals() else DEFAULT_API_BASE_URL,
                     headers=api_headers if 'api_headers' in locals() else None
                 )
             except:
                 pass  # Ignore errors when updating status on failure
+        
+        # Cleanup downloaded video even on error
+        if 'downloaded_video_path' in locals() and downloaded_video_path:
+            try:
+                cleanup_video(downloaded_video_path)
+            except:
+                pass
         
         return {
             "error": error_msg,
