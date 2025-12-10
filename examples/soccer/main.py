@@ -280,6 +280,198 @@ def detect_passes(
     return events
 
 
+def detect_passes_enhanced(
+    frames_metadata: List[Dict[str, Any]],
+    fps: float,
+    short_pass_threshold_px: float = 150,
+    long_pass_threshold_px: float = 300,
+    possession_distance_px: float = 60.0,
+    min_possession_frames: int = 5,
+    min_flight_frames: int = 3,
+    min_pass_distance_px: float = 50.0
+) -> List[Dict[str, Any]]:
+    """
+    Enhanced pass detection with confirmed possession before and after pass.
+    
+    Key improvements:
+    - Requires confirmed possession (multiple frames) before considering as passer
+    - Requires confirmed possession (multiple frames) before confirming receiver
+    - Ball must be in flight (no owner) for minimum frames
+    - Minimum pass distance to avoid false positives
+    - No duplicate passes
+    
+    Args:
+        frames_metadata: List of frame data with ball_center, player_tracks, timestamp_str
+        fps: Video frames per second
+        short_pass_threshold_px: Distance threshold for short passes
+        long_pass_threshold_px: Distance threshold for long passes  
+        possession_distance_px: Max distance to consider ball possession
+        min_possession_frames: Frames a player must have ball to confirm possession
+        min_flight_frames: Minimum frames ball must be in flight for valid pass
+        min_pass_distance_px: Minimum distance for a valid pass
+    
+    Returns:
+        List of pass events with timestamps
+    """
+    events: List[Dict[str, Any]] = []
+    
+    # State tracking
+    possession_history: List[Optional[int]] = []  # Track who has ball each frame
+    ball_positions: List[Optional[List[float]]] = []  # Track ball position each frame
+    
+    # First pass: Build possession history
+    for entry in frames_metadata:
+        ball_center = entry.get("ball_center")
+        player_tracks = entry.get("player_tracks", [])
+        owner = find_nearest_player(ball_center, player_tracks, possession_distance_px)
+        possession_history.append(owner)
+        ball_positions.append(ball_center)
+    
+    # Second pass: Find confirmed possessions and passes
+    confirmed_owner: Optional[int] = None
+    confirmed_owner_start_frame: int = 0
+    confirmed_owner_start_pos: Optional[List[float]] = None
+    
+    potential_pass_start_frame: Optional[int] = None
+    potential_pass_start_pos: Optional[List[float]] = None
+    potential_passer: Optional[int] = None
+    flight_frames: int = 0
+    
+    last_pass_end_frame: int = -100
+    seen_passes: Set[Tuple[int, int]] = set()  # (passer, receiver) - last pass pair
+    
+    i = 0
+    while i < len(frames_metadata):
+        entry = frames_metadata[i]
+        frame_index = entry["frame_index"]
+        timestamp_sec = entry["timestamp"]
+        timestamp_str = entry.get("timestamp_str", f"{timestamp_sec:.2f}s")
+        ball_center = ball_positions[i]
+        current_owner = possession_history[i]
+        
+        # Count consecutive frames with same owner
+        consecutive_same_owner = 0
+        if current_owner is not None:
+            for j in range(i, min(i + min_possession_frames + 2, len(possession_history))):
+                if possession_history[j] == current_owner:
+                    consecutive_same_owner += 1
+                else:
+                    break
+        
+        # STATE 1: No confirmed owner yet - look for one
+        if confirmed_owner is None:
+            if current_owner is not None and consecutive_same_owner >= min_possession_frames:
+                # Confirmed new possession
+                confirmed_owner = current_owner
+                confirmed_owner_start_frame = frame_index
+                confirmed_owner_start_pos = ball_center
+            i += 1
+            continue
+        
+        # STATE 2: Have confirmed owner - check if they still have it
+        if current_owner == confirmed_owner:
+            # Still has possession - update position
+            confirmed_owner_start_pos = ball_center
+            potential_pass_start_frame = None
+            flight_frames = 0
+            i += 1
+            continue
+        
+        # STATE 3: Ball left confirmed owner - potential pass started
+        if current_owner is None and ball_center is not None:
+            # Ball in flight
+            if potential_pass_start_frame is None:
+                potential_pass_start_frame = frame_index
+                potential_pass_start_pos = confirmed_owner_start_pos
+                potential_passer = confirmed_owner
+            flight_frames += 1
+            i += 1
+            continue
+        
+        # STATE 4: New player might have the ball
+        if current_owner is not None and current_owner != confirmed_owner:
+            # Check if new player has confirmed possession
+            if consecutive_same_owner >= min_possession_frames:
+                # New player has confirmed possession!
+                
+                # Validate this is a real pass
+                is_valid_pass = True
+                
+                # Check 1: Must have had flight time
+                if flight_frames < min_flight_frames:
+                    is_valid_pass = False
+                
+                # Check 2: Must have minimum distance
+                if potential_pass_start_pos and ball_center:
+                    distance = float(np.linalg.norm(
+                        np.array(potential_pass_start_pos) - np.array(ball_center)
+                    ))
+                else:
+                    distance = 0.0
+                    is_valid_pass = False
+                
+                if distance < min_pass_distance_px:
+                    is_valid_pass = False
+                
+                # Check 3: No immediate duplicate (same passer->receiver)
+                pass_pair = (potential_passer, current_owner)
+                if pass_pair == seen_passes:
+                    # Check time gap
+                    if frame_index - last_pass_end_frame < fps:  # Within 1 second
+                        is_valid_pass = False
+                
+                # Check 4: Minimum time since last pass
+                if frame_index - last_pass_end_frame < min_possession_frames:
+                    is_valid_pass = False
+                
+                if is_valid_pass and potential_passer is not None:
+                    # Get timestamps for pass start
+                    start_entry = frames_metadata[potential_pass_start_frame] if potential_pass_start_frame else entry
+                    start_timestamp_str = start_entry.get("timestamp_str", f"{start_entry['timestamp']:.2f}s")
+                    
+                    # Classify pass type
+                    if distance >= long_pass_threshold_px:
+                        pass_type = "long"
+                    elif distance >= short_pass_threshold_px:
+                        pass_type = "medium"
+                    else:
+                        pass_type = "short"
+                    
+                    duration = timestamp_sec - start_entry["timestamp"]
+                    
+                    events.append({
+                        "start_frame": potential_pass_start_frame or confirmed_owner_start_frame,
+                        "start_time": start_entry["timestamp"],
+                        "start_timestamp_str": start_timestamp_str,
+                        "end_frame": frame_index,
+                        "end_time": timestamp_sec,
+                        "end_timestamp_str": timestamp_str,
+                        "passer_id": potential_passer,
+                        "receiver_id": current_owner,
+                        "distance_px": distance,
+                        "duration_s": duration,
+                        "pass_type": pass_type,
+                        "flight_frames": flight_frames
+                    })
+                    
+                    seen_passes = pass_pair
+                    last_pass_end_frame = frame_index
+                
+                # Transfer possession
+                confirmed_owner = current_owner
+                confirmed_owner_start_frame = frame_index
+                confirmed_owner_start_pos = ball_center
+                potential_pass_start_frame = None
+                flight_frames = 0
+            else:
+                # Not confirmed yet - might be noise, continue tracking
+                pass
+        
+        i += 1
+    
+    return events
+
+
 def export_pass_events_to_csv(events: List[Dict[str, Any]], csv_path: str) -> None:
     if not events:
         with open(csv_path, 'w', newline='', encoding='utf-8') as csv_file:
@@ -1206,7 +1398,7 @@ def run_frame_extraction(
     
     # Save CSV for easy viewing
     csv_path = os.path.join(output_dir, "detections.csv")
-    print(f"[Frame Extraction] Saving CSV to {csv_path}")
+    print(f"[Frame Extraction] Saving detections CSV to {csv_path}")
     with open(csv_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         writer.writerow([
@@ -1227,10 +1419,80 @@ def run_frame_extraction(
                 player_ids
             ])
     
+    # ========== PASS DETECTION ==========
+    print("[Frame Extraction] Detecting passes...")
+    
+    # Convert detections to format expected by pass detection
+    frames_for_pass_detection = []
+    for det in all_detections:
+        player_tracks = []
+        for p in det["players"]:
+            if p["tracker_id"] is not None:
+                # Calculate bottom center from bbox
+                bbox = p["bbox"]
+                bottom_center = [(bbox[0] + bbox[2]) / 2, bbox[3]]  # center x, bottom y
+                player_tracks.append({
+                    "tracker_id": p["tracker_id"],
+                    "class_id": p["class_id"],
+                    "bottom_center": bottom_center
+                })
+        
+        ball_center = det["ball"]["center"] if det["ball"] else None
+        
+        frames_for_pass_detection.append({
+            "frame_index": det["frame_index"],
+            "timestamp": det["timestamp_sec"],
+            "timestamp_str": det["timestamp_str"],
+            "ball_center": ball_center,
+            "player_tracks": player_tracks,
+            "status": "tracked" if det["ball"] else "missed"
+        })
+    
+    # Detect passes with improved logic
+    pass_events = detect_passes_enhanced(frames_for_pass_detection, fps)
+    
+    # Save passes CSV
+    passes_csv_path = os.path.join(output_dir, "passes.csv")
+    print(f"[Frame Extraction] Saving passes CSV to {passes_csv_path}")
+    with open(passes_csv_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "pass_id", "pass_type",
+            "initiator_id", "receiver_id",
+            "start_frame", "start_timestamp",
+            "end_frame", "end_timestamp",
+            "duration_sec", "distance_px"
+        ])
+        for i, evt in enumerate(pass_events, 1):
+            writer.writerow([
+                i,
+                evt["pass_type"],
+                evt["passer_id"],
+                evt["receiver_id"],
+                evt["start_frame"],
+                evt["start_timestamp_str"],
+                evt["end_frame"],
+                evt["end_timestamp_str"],
+                round(evt["duration_s"], 3),
+                round(evt["distance_px"], 1)
+            ])
+    
+    # Save passes JSON for detailed data
+    passes_json_path = os.path.join(output_dir, "passes.json")
+    with open(passes_json_path, 'w', encoding='utf-8') as f:
+        json.dump({
+            "total_passes": len(pass_events),
+            "short_passes": len([e for e in pass_events if e["pass_type"] == "short"]),
+            "long_passes": len([e for e in pass_events if e["pass_type"] == "long"]),
+            "passes": pass_events
+        }, f, indent=2)
+    
     print(f"\n✅ Done! Output saved to: {output_dir}")
     print(f"   - Frames: {frames_dir}/ ({total_frames} images)")
     print(f"   - Metadata: {metadata_path}")
-    print(f"   - CSV: {csv_path}")
+    print(f"   - Detections CSV: {csv_path}")
+    print(f"   - Passes CSV: {passes_csv_path} ({len(pass_events)} passes detected)")
+    print(f"   - Passes JSON: {passes_json_path}")
 
 
 def main(
