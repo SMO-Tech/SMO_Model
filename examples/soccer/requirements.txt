@@ -5,3 +5,4 @@ supervision
 opencv-python
 numpy
 tqdm
+yt-dlp
