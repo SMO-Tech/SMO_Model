@@ -18,10 +18,13 @@ else:
 
 # Import will happen after path setup
 try:
-    from tools.api_client import send_pass_data_with_summary
+    from tools.api_client import send_pass_data_with_summary, update_match_status, DEFAULT_API_BASE_URL
 except ImportError:
     # Fallback if api_client not available
+    DEFAULT_API_BASE_URL = "http://api.scoutme.cloud"
     def send_pass_data_with_summary(*args, **kwargs):
+        return {"success": False, "error": "API client not available"}
+    def update_match_status(*args, **kwargs):
         return {"success": False, "error": "API client not available"}
 
 
@@ -80,6 +83,8 @@ def handler(event):
             "video_url": "https://...",  # or "video_path": "/path/to/video.mp4"
             "device": "cuda",  # optional, default: "cuda"
             "output_dir": "/path/to/output",  # optional
+            "match_id": "5ff7800c-e9ea-4962-a0d6-035ffe59de3c",  # required for API status updates
+            "api_base_url": "http://api.scoutme.cloud",  # optional: API base URL
             "api_url": "https://api.example.com/api/passes",  # optional: API endpoint to send JSON data
             "api_headers": {"Authorization": "Bearer token"},  # optional: custom headers for API
             "video_id": "video_123"  # optional: video identifier for API
@@ -93,9 +98,23 @@ def handler(event):
         video_path = input_data.get('video_path')
         device = input_data.get('device', 'cuda')
         output_dir = input_data.get('output_dir')
-        api_url = input_data.get('api_url')  # Optional API endpoint
+        match_id = input_data.get('match_id')  # Match ID for status updates
+        api_base_url = input_data.get('api_base_url', DEFAULT_API_BASE_URL)
+        api_url = input_data.get('api_url')  # Optional API endpoint for pass data
         api_headers = input_data.get('api_headers')  # Optional API headers
         video_id = input_data.get('video_id')  # Optional video ID
+        
+        # Step 0: Update match status to "processing" if match_id provided
+        if match_id:
+            print(f"Step 0: Updating match status to 'processing'...")
+            status_result = update_match_status(
+                match_id=match_id,
+                status="processing",
+                base_url=api_base_url,
+                headers=api_headers
+            )
+            if not status_result.get("success"):
+                print(f"⚠️  Warning: Could not update match status: {status_result.get('error')}")
         
         # Ensure models are available
         ensure_models()
@@ -273,6 +292,20 @@ def handler(event):
                 results["api_error"] = str(api_error)
                 print(f"⚠️  Error sending data to API: {str(api_error)}")
         
+        # Step 5: Update match status to "completed" if match_id provided
+        if match_id:
+            print(f"Step 5: Updating match status to 'completed'...")
+            status_result = update_match_status(
+                match_id=match_id,
+                status="COMPLETED",
+                base_url=api_base_url,
+                headers=api_headers
+            )
+            if status_result.get("success"):
+                results["match_status"] = "completed"
+            else:
+                results["match_status_error"] = status_result.get("error")
+        
         return results
         
     except Exception as e:
@@ -280,6 +313,19 @@ def handler(event):
         traceback_str = traceback.format_exc()
         print(f"ERROR: {error_msg}")
         print(traceback_str)
+        
+        # Update match status to "failed" if match_id was provided
+        if 'match_id' in locals() and match_id:
+            try:
+                update_match_status(
+                    match_id=match_id,
+                    status="failed",
+                    base_url=api_base_url if 'api_base_url' in locals() else DEFAULT_API_BASE_URL,
+                    headers=api_headers if 'api_headers' in locals() else None
+                )
+            except:
+                pass  # Ignore errors when updating status on failure
+        
         return {
             "error": error_msg,
             "traceback": traceback_str

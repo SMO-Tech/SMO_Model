@@ -6,6 +6,79 @@ import requests
 from pathlib import Path
 from typing import Dict, Optional, Any
 
+# Default API base URL
+DEFAULT_API_BASE_URL = "http://api.scoutme.cloud"
+
+
+def update_match_status(
+    match_id: str,
+    status: str,
+    base_url: str = DEFAULT_API_BASE_URL,
+    headers: Optional[Dict[str, str]] = None,
+    timeout: int = 30
+) -> Dict[str, Any]:
+    """
+    Update match status via API (call this before/after processing)
+    
+    Args:
+        match_id: UUID of the match
+        status: Status to set ("processing", "completed", "failed", etc.)
+        base_url: API base URL (default: http://api.scoutme.cloud)
+        headers: Custom HTTP headers (e.g., Authorization)
+        timeout: Request timeout in seconds
+    
+    Returns:
+        Dict with success status and response
+    """
+    try:
+        api_url = f"{base_url.rstrip('/')}/match/{match_id}"
+        
+        payload = {
+            "status": status
+        }
+        
+        request_headers = {
+            "Content-Type": "application/json"
+        }
+        if headers:
+            request_headers.update(headers)
+        
+        print(f"[API] Updating match {match_id} status to '{status}'...")
+        response = requests.post(
+            api_url,
+            json=payload,
+            headers=request_headers,
+            timeout=timeout
+        )
+        
+        if response.status_code in [200, 201]:
+            print(f"[API] ✅ Status updated successfully")
+            return {
+                "success": True,
+                "status_code": response.status_code,
+                "response": response.json() if response.content else {}
+            }
+        else:
+            print(f"[API] ⚠️ Status update failed: {response.status_code}")
+            return {
+                "success": False,
+                "status_code": response.status_code,
+                "error": f"API returned status {response.status_code}: {response.text[:200]}"
+            }
+            
+    except requests.exceptions.RequestException as e:
+        print(f"[API] ❌ Request failed: {str(e)}")
+        return {
+            "success": False,
+            "error": f"Request failed: {str(e)}"
+        }
+    except Exception as e:
+        print(f"[API] ❌ Unexpected error: {str(e)}")
+        return {
+            "success": False,
+            "error": f"Unexpected error: {str(e)}"
+        }
+
 
 def send_pass_data_with_summary(
     json_path: Path,
