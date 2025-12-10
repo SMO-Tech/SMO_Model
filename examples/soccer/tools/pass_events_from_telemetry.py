@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
-import numpy as np
+import numpy as np  # type: ignore[import-untyped]
 
 
 @dataclass

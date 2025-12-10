@@ -3,12 +3,13 @@ import csv
 import json
 import os
 from enum import Enum
-from typing import Any, Dict, Iterator, List, Optional, Set
-import cv2
-import numpy as np
-import supervision as sv
-from tqdm import tqdm
-from ultralytics import YOLO
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
+import cv2  # type: ignore[import-untyped]
+import numpy as np  # type: ignore[import-untyped]
+import supervision as sv  # type: ignore[import-untyped]
+import torch  # type: ignore[import-untyped]
+from tqdm import tqdm  # type: ignore[import-untyped]
+from ultralytics import YOLO  # type: ignore[import-untyped]
 
 from sports.annotators.soccer import draw_pitch, draw_points_on_pitch
 from sports.common.ball import BallTracker, BallAnnotator
@@ -79,6 +80,53 @@ CLASS_NAME_LOOKUP = {
 }
 
 PASS_DISTANCE_THRESHOLD_PX = 250
+
+# Detection settings
+DEFAULT_BALL_IMGSZ = 960  # Higher resolution for ball detection
+DEFAULT_PLAYER_IMGSZ = 1536  # Higher resolution for player detection
+DEFAULT_BALL_CONF = 0.10  # Lower confidence threshold for ball
+DEFAULT_PLAYER_CONF = 0.25  # Confidence threshold for players
+DEFAULT_NMS_THRESHOLD = 0.1  # NMS threshold
+SLICE_OVERLAP_RATIO = 0.25  # 25% overlap between slices
+
+
+def setup_gpu_optimizations(device: str) -> None:
+    """
+    Configure GPU optimizations for faster inference.
+    
+    Args:
+        device: Device string ('cpu', 'cuda', 'mps', etc.)
+    """
+    if 'cuda' in device or device.startswith('cuda'):
+        # Enable TensorFloat-32 for Ampere GPUs (30xx, A100, etc.)
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        # Enable cudnn benchmark for consistent input sizes
+        torch.backends.cudnn.benchmark = True
+
+
+def load_model(
+    model_path: str,
+    device: str,
+) -> YOLO:
+    """
+    Load a YOLO model.
+    
+    Args:
+        model_path: Path to the model weights.
+        device: Device to load model on.
+        
+    Returns:
+        YOLO: Loaded model.
+    """
+    model = YOLO(model_path)
+    model.to(device=device)
+    return model
+
+
+def is_cuda_device(device: str) -> bool:
+    """Check if device is CUDA."""
+    return 'cuda' in device or device.startswith('cuda')
 
 
 def create_empty_detections() -> sv.Detections:
@@ -264,6 +312,8 @@ class Mode(Enum):
     TEAM_CLASSIFICATION = 'TEAM_CLASSIFICATION'
     RADAR = 'RADAR'
     BALL_DETECTION_RECOVERY = 'BALL_DETECTION_RECOVERY'
+    COMBINED_DETECTION = 'COMBINED_DETECTION'
+    FRAME_EXTRACTION = 'FRAME_EXTRACTION'  # Extract frames with annotations
 
 
 def get_crops(frame: np.ndarray, detections: sv.Detections) -> List[np.ndarray]:
@@ -342,19 +392,50 @@ def render_radar(
     return radar
 
 
-def run_pitch_detection(source_video_path: str, device: str) -> Iterator[np.ndarray]:
+def create_inference_slicer(
+    callback,
+    slice_wh: Tuple[int, int] = (640, 640),
+    overlap_ratio: float = SLICE_OVERLAP_RATIO
+) -> sv.InferenceSlicer:
+    """
+    Create an InferenceSlicer with configurable overlap.
+    
+    Args:
+        callback: Detection callback function.
+        slice_wh: Slice width and height.
+        overlap_ratio: Overlap ratio between slices (0-1).
+        
+    Returns:
+        sv.InferenceSlicer: Configured slicer.
+    """
+    overlap_wh = (int(slice_wh[0] * overlap_ratio), int(slice_wh[1] * overlap_ratio))
+    return sv.InferenceSlicer(
+        callback=callback,
+        slice_wh=slice_wh,
+        overlap_wh=overlap_wh,
+    )
+
+
+def run_pitch_detection(
+    source_video_path: str,
+    device: str,
+    high_accuracy: bool = False
+) -> Iterator[np.ndarray]:
     """
     Run pitch detection on a video and yield annotated frames.
 
     Args:
         source_video_path (str): Path to the source video.
         device (str): Device to run the model on (e.g., 'cpu', 'cuda').
+        high_accuracy (bool): Use higher accuracy settings.
 
     Yields:
         Iterator[np.ndarray]: Iterator over annotated frames.
     """
-    pitch_detection_model = YOLO(PITCH_DETECTION_MODEL_PATH).to(device=device)
+    setup_gpu_optimizations(device)
+    pitch_detection_model = load_model(PITCH_DETECTION_MODEL_PATH, device)
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
+    
     for frame in frame_generator:
         result = pitch_detection_model(frame, verbose=False)[0]
         keypoints = sv.KeyPoints.from_ultralytics(result)
@@ -365,22 +446,36 @@ def run_pitch_detection(source_video_path: str, device: str) -> Iterator[np.ndar
         yield annotated_frame
 
 
-def run_player_detection(source_video_path: str, device: str) -> Iterator[np.ndarray]:
+def run_player_detection(
+    source_video_path: str,
+    device: str,
+    high_accuracy: bool = False
+) -> Iterator[np.ndarray]:
     """
     Run player detection on a video and yield annotated frames.
 
     Args:
         source_video_path (str): Path to the source video.
         device (str): Device to run the model on (e.g., 'cpu', 'cuda').
+        high_accuracy (bool): Use higher accuracy settings (1536px resolution).
 
     Yields:
         Iterator[np.ndarray]: Iterator over annotated frames.
     """
-    player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
+    setup_gpu_optimizations(device)
+    player_detection_model = load_model(PLAYER_DETECTION_MODEL_PATH, device)
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
+    
+    imgsz = DEFAULT_PLAYER_IMGSZ if high_accuracy else 1280
+    conf = DEFAULT_PLAYER_CONF
+    
     for frame in frame_generator:
-        result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
+        result = player_detection_model(
+            frame, imgsz=imgsz, conf=conf, verbose=False
+        )[0]
         detections = sv.Detections.from_ultralytics(result)
+        # Apply stricter NMS
+        detections = detections.with_nms(threshold=DEFAULT_NMS_THRESHOLD)
 
         annotated_frame = frame.copy()
         annotated_frame = BOX_ANNOTATOR.annotate(annotated_frame, detections)
@@ -388,34 +483,62 @@ def run_player_detection(source_video_path: str, device: str) -> Iterator[np.nda
         yield annotated_frame
 
 
-def run_ball_detection(source_video_path: str, device: str) -> Iterator[np.ndarray]:
+def run_ball_detection(
+    source_video_path: str,
+    device: str,
+    high_accuracy: bool = False
+) -> Iterator[np.ndarray]:
     """
     Run ball detection on a video and yield annotated frames.
 
     Args:
         source_video_path (str): Path to the source video.
         device (str): Device to run the model on (e.g., 'cpu', 'cuda').
+        high_accuracy (bool): Use higher accuracy settings (960px, ByteTrack).
 
     Yields:
         Iterator[np.ndarray]: Iterator over annotated frames.
     """
-    ball_detection_model = YOLO(BALL_DETECTION_MODEL_PATH).to(device=device)
+    setup_gpu_optimizations(device)
+    ball_detection_model = load_model(BALL_DETECTION_MODEL_PATH, device)
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
-    ball_tracker = BallTracker(buffer_size=20)
+    
+    # Enhanced ball tracker with velocity prediction
+    ball_tracker = BallTracker(
+        buffer_size=30,
+        velocity_alpha=0.3,
+        max_prediction_frames=5
+    )
     ball_annotator = BallAnnotator(radius=6, buffer_size=10)
+    
+    # ByteTrack for ball (consistent with player tracking)
+    ball_bytetrack = sv.ByteTrack(
+        minimum_consecutive_frames=3,
+        lost_track_buffer=30,
+    )
+    
+    imgsz = DEFAULT_BALL_IMGSZ if high_accuracy else 640
+    conf = DEFAULT_BALL_CONF
 
     def callback(image_slice: np.ndarray) -> sv.Detections:
-        result = ball_detection_model(image_slice, imgsz=640, verbose=False)[0]
+        result = ball_detection_model(
+            image_slice, imgsz=imgsz, conf=conf, verbose=False
+        )[0]
         return sv.Detections.from_ultralytics(result)
 
-    slicer = sv.InferenceSlicer(
-        callback=callback,
-        slice_wh=(640, 640),
-    )
+    # Use overlapping slices for better boundary detection
+    slicer = create_inference_slicer(callback, slice_wh=(640, 640))
 
     for frame in frame_generator:
-        detections = slicer(frame).with_nms(threshold=0.1)
+        detections = slicer(frame).with_nms(threshold=DEFAULT_NMS_THRESHOLD)
+        
+        # Apply ByteTrack for consistent tracking
+        if high_accuracy:
+            detections = ball_bytetrack.update_with_detections(detections)
+        
+        # Apply velocity-based tracker
         detections = ball_tracker.update(detections)
+        
         annotated_frame = frame.copy()
         annotated_frame = ball_annotator.annotate(annotated_frame, detections)
         yield annotated_frame
@@ -427,8 +550,9 @@ def run_ball_detection_with_recovery(
     device: str,
     output_dir: str,
     pass_csv_path: Optional[str] = None,
-    recovery_imgsz: int = 960,
-    show_preview: bool = False
+    recovery_imgsz: int = DEFAULT_BALL_IMGSZ,
+    show_preview: bool = False,
+    high_accuracy: bool = False
 ) -> None:
     """
     Run ball detection with a recovery pass and export annotated frames plus pass stats.
@@ -436,6 +560,7 @@ def run_ball_detection_with_recovery(
     if not output_dir:
         raise ValueError("ball_output_dir is required for BALL_DETECTION_RECOVERY mode.")
 
+    setup_gpu_optimizations(device)
     os.makedirs(output_dir, exist_ok=True)
     directories = ensure_output_dirs(output_dir)
     metadata_path = os.path.join(output_dir, "ball_detections.json")
@@ -445,15 +570,20 @@ def run_ball_detection_with_recovery(
     video_info = sv.VideoInfo.from_video_path(source_video_path)
     fps = video_info.fps if video_info.fps else 30.0
 
-    ball_detection_model = YOLO(BALL_DETECTION_MODEL_PATH).to(device=device)
-    recovery_detection_model = YOLO(BALL_DETECTION_MODEL_PATH).to(device=device)
-    player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
+    ball_detection_model = load_model(BALL_DETECTION_MODEL_PATH, device)
+    recovery_detection_model = load_model(BALL_DETECTION_MODEL_PATH, device)
+    player_detection_model = load_model(PLAYER_DETECTION_MODEL_PATH, device)
+
+    base_imgsz = DEFAULT_BALL_IMGSZ if high_accuracy else 640
+    player_imgsz = DEFAULT_PLAYER_IMGSZ if high_accuracy else 1280
 
     def base_callback(image_slice: np.ndarray) -> sv.Detections:
-        result = ball_detection_model(image_slice, imgsz=640, verbose=False)[0]
+        result = ball_detection_model(
+            image_slice, imgsz=base_imgsz, conf=DEFAULT_BALL_CONF, verbose=False
+        )[0]
         return sv.Detections.from_ultralytics(result)
 
-    slicer = sv.InferenceSlicer(callback=base_callback, slice_wh=(640, 640))
+    slicer = create_inference_slicer(base_callback, slice_wh=(640, 640))
 
     first_pass_detections: List[sv.Detections] = []
     missed_indices: Set[int] = set()
@@ -461,14 +591,19 @@ def run_ball_detection_with_recovery(
     
     print(f"[Pass 1/2] Detecting ball in {video_info.total_frames} frames...")
     for frame_idx, frame in enumerate(tqdm(frame_generator, total=video_info.total_frames, desc="Ball detection")):
-        detections = slicer(frame).with_nms(threshold=0.1)
+        detections = slicer(frame).with_nms(threshold=DEFAULT_NMS_THRESHOLD)
         first_pass_detections.append(detections)
         if len(detections) == 0:
             missed_indices.add(frame_idx)
     
     print(f"[Pass 1/2] Ball detected in {len(first_pass_detections) - len(missed_indices)} frames, missed in {len(missed_indices)} frames.")
 
-    ball_tracker = BallTracker(buffer_size=20)
+    # Enhanced ball tracker with velocity prediction
+    ball_tracker = BallTracker(
+        buffer_size=30,
+        velocity_alpha=0.3,
+        max_prediction_frames=5
+    )
     ball_annotator = BallAnnotator(radius=6, buffer_size=10)
     player_tracker = sv.ByteTrack(minimum_consecutive_frames=3)
     metadata: List[Dict[str, Any]] = []
@@ -484,12 +619,14 @@ def run_ball_detection_with_recovery(
             )
             if frame_idx in missed_indices:
                 recovery_result = recovery_detection_model(
-                    frame, imgsz=recovery_imgsz, verbose=False
+                    frame, imgsz=recovery_imgsz, conf=DEFAULT_BALL_CONF, verbose=False
                 )[0]
                 ball_detections = sv.Detections.from_ultralytics(recovery_result)
 
             tracked_ball = ball_tracker.update(ball_detections)
-            player_result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
+            player_result = player_detection_model(
+                frame, imgsz=player_imgsz, conf=DEFAULT_PLAYER_CONF, verbose=False
+            )[0]
             player_detections = sv.Detections.from_ultralytics(player_result)
             tracked_players = player_tracker.update_with_detections(player_detections)
 
@@ -546,23 +683,35 @@ def run_ball_detection_with_recovery(
     print(f"✓ Done! Check output in: {output_dir}")
 
 
-def run_player_tracking(source_video_path: str, device: str) -> Iterator[np.ndarray]:
+def run_player_tracking(
+    source_video_path: str,
+    device: str,
+    high_accuracy: bool = False
+) -> Iterator[np.ndarray]:
     """
     Run player tracking on a video and yield annotated frames with tracked players.
 
     Args:
         source_video_path (str): Path to the source video.
         device (str): Device to run the model on (e.g., 'cpu', 'cuda').
+        high_accuracy (bool): Use higher accuracy settings.
 
     Yields:
         Iterator[np.ndarray]: Iterator over annotated frames.
     """
-    player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
+    setup_gpu_optimizations(device)
+    player_detection_model = load_model(PLAYER_DETECTION_MODEL_PATH, device)
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
     tracker = sv.ByteTrack(minimum_consecutive_frames=3)
+    
+    imgsz = DEFAULT_PLAYER_IMGSZ if high_accuracy else 1280
+    
     for frame in frame_generator:
-        result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
+        result = player_detection_model(
+            frame, imgsz=imgsz, conf=DEFAULT_PLAYER_CONF, verbose=False
+        )[0]
         detections = sv.Detections.from_ultralytics(result)
+        detections = detections.with_nms(threshold=DEFAULT_NMS_THRESHOLD)
         detections = tracker.update_with_detections(detections)
 
         labels = [str(tracker_id) for tracker_id in detections.tracker_id]
@@ -574,24 +723,34 @@ def run_player_tracking(source_video_path: str, device: str) -> Iterator[np.ndar
         yield annotated_frame
 
 
-def run_team_classification(source_video_path: str, device: str) -> Iterator[np.ndarray]:
+def run_team_classification(
+    source_video_path: str,
+    device: str,
+    high_accuracy: bool = False
+) -> Iterator[np.ndarray]:
     """
     Run team classification on a video and yield annotated frames with team colors.
 
     Args:
         source_video_path (str): Path to the source video.
         device (str): Device to run the model on (e.g., 'cpu', 'cuda').
+        high_accuracy (bool): Use higher accuracy settings.
 
     Yields:
         Iterator[np.ndarray]: Iterator over annotated frames.
     """
-    player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
+    setup_gpu_optimizations(device)
+    player_detection_model = load_model(PLAYER_DETECTION_MODEL_PATH, device)
     frame_generator = sv.get_video_frames_generator(
         source_path=source_video_path, stride=STRIDE)
 
+    imgsz = DEFAULT_PLAYER_IMGSZ if high_accuracy else 1280
+
     crops = []
     for frame in tqdm(frame_generator, desc='collecting crops'):
-        result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
+        result = player_detection_model(
+            frame, imgsz=imgsz, conf=DEFAULT_PLAYER_CONF, verbose=False
+        )[0]
         detections = sv.Detections.from_ultralytics(result)
         crops += get_crops(frame, detections[detections.class_id == PLAYER_CLASS_ID])
 
@@ -601,8 +760,11 @@ def run_team_classification(source_video_path: str, device: str) -> Iterator[np.
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
     tracker = sv.ByteTrack(minimum_consecutive_frames=3)
     for frame in frame_generator:
-        result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
+        result = player_detection_model(
+            frame, imgsz=imgsz, conf=DEFAULT_PLAYER_CONF, verbose=False
+        )[0]
         detections = sv.Detections.from_ultralytics(result)
+        detections = detections.with_nms(threshold=DEFAULT_NMS_THRESHOLD)
         detections = tracker.update_with_detections(detections)
 
         players = detections[detections.class_id == PLAYER_CLASS_ID]
@@ -631,15 +793,35 @@ def run_team_classification(source_video_path: str, device: str) -> Iterator[np.
         yield annotated_frame
 
 
-def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
-    player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
-    pitch_detection_model = YOLO(PITCH_DETECTION_MODEL_PATH).to(device=device)
+def run_radar(
+    source_video_path: str,
+    device: str,
+    high_accuracy: bool = False
+) -> Iterator[np.ndarray]:
+    """
+    Run radar visualization with player and pitch detection.
+    
+    Args:
+        source_video_path (str): Path to the source video.
+        device (str): Device to run the model on.
+        high_accuracy (bool): Use higher accuracy settings.
+        
+    Yields:
+        Iterator[np.ndarray]: Iterator over annotated frames.
+    """
+    setup_gpu_optimizations(device)
+    player_detection_model = load_model(PLAYER_DETECTION_MODEL_PATH, device)
+    pitch_detection_model = load_model(PITCH_DETECTION_MODEL_PATH, device)
     frame_generator = sv.get_video_frames_generator(
         source_path=source_video_path, stride=STRIDE)
 
+    imgsz = DEFAULT_PLAYER_IMGSZ if high_accuracy else 1280
+
     crops = []
     for frame in tqdm(frame_generator, desc='collecting crops'):
-        result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
+        result = player_detection_model(
+            frame, imgsz=imgsz, conf=DEFAULT_PLAYER_CONF, verbose=False
+        )[0]
         detections = sv.Detections.from_ultralytics(result)
         crops += get_crops(frame, detections[detections.class_id == PLAYER_CLASS_ID])
 
@@ -651,8 +833,11 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
     for frame in frame_generator:
         result = pitch_detection_model(frame, verbose=False)[0]
         keypoints = sv.KeyPoints.from_ultralytics(result)
-        result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
+        result = player_detection_model(
+            frame, imgsz=imgsz, conf=DEFAULT_PLAYER_CONF, verbose=False
+        )[0]
         detections = sv.Detections.from_ultralytics(result)
+        detections = detections.with_nms(threshold=DEFAULT_NMS_THRESHOLD)
         detections = tracker.update_with_detections(detections)
 
         players = detections[detections.class_id == PLAYER_CLASS_ID]
@@ -694,6 +879,360 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
         yield annotated_frame
 
 
+def run_combined_detection(
+    source_video_path: str,
+    device: str,
+    high_accuracy: bool = True
+) -> Iterator[np.ndarray]:
+    """
+    Combined detection mode that does everything:
+    - Player detection (high resolution)
+    - Ball detection (high resolution)
+    - Team classification
+    - ByteTrack for both players and ball
+    - Velocity-based ball prediction
+
+    Args:
+        source_video_path (str): Path to the source video.
+        device (str): Device to run the model on (e.g., 'cpu', 'cuda').
+        high_accuracy (bool): Use high accuracy settings (default True).
+
+    Yields:
+        Iterator[np.ndarray]: Iterator over annotated frames.
+    """
+    setup_gpu_optimizations(device)
+    
+    # Load models with FP16
+    player_detection_model = load_model(PLAYER_DETECTION_MODEL_PATH, device)
+    ball_detection_model = load_model(BALL_DETECTION_MODEL_PATH, device)
+    pitch_detection_model = load_model(PITCH_DETECTION_MODEL_PATH, device)
+    
+    # Settings
+    player_imgsz = DEFAULT_PLAYER_IMGSZ if high_accuracy else 1280
+    ball_imgsz = DEFAULT_BALL_IMGSZ if high_accuracy else 640
+    
+    # First pass: collect crops for team classification
+    print("[Combined] Collecting player crops for team classification...")
+    frame_generator = sv.get_video_frames_generator(
+        source_path=source_video_path, stride=STRIDE)
+    
+    crops = []
+    for frame in tqdm(frame_generator, desc='collecting crops'):
+        result = player_detection_model(
+            frame, imgsz=player_imgsz, conf=DEFAULT_PLAYER_CONF, verbose=False
+        )[0]
+        detections = sv.Detections.from_ultralytics(result)
+        crops += get_crops(frame, detections[detections.class_id == PLAYER_CLASS_ID])
+    
+    # Train team classifier
+    team_classifier = TeamClassifier(device=device)
+    team_classifier.fit(crops)
+    
+    # Initialize trackers
+    player_tracker = sv.ByteTrack(minimum_consecutive_frames=3)
+    ball_bytetrack = sv.ByteTrack(
+        minimum_consecutive_frames=3,
+        lost_track_buffer=30,
+    )
+    
+    # Enhanced ball tracker with velocity prediction
+    ball_tracker = BallTracker(
+        buffer_size=30,
+        velocity_alpha=0.3,
+        max_prediction_frames=5
+    )
+    ball_annotator = BallAnnotator(radius=6, buffer_size=10)
+    
+    # Ball detection callback with overlapping slices
+    def ball_callback(image_slice: np.ndarray) -> sv.Detections:
+        result = ball_detection_model(
+            image_slice, imgsz=ball_imgsz, conf=DEFAULT_BALL_CONF, verbose=False
+        )[0]
+        return sv.Detections.from_ultralytics(result)
+    
+    ball_slicer = create_inference_slicer(ball_callback, slice_wh=(640, 640))
+    
+    # Second pass: full detection
+    print("[Combined] Running full detection pipeline...")
+    frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
+    
+    for frame in frame_generator:
+        # Pitch detection for radar
+        pitch_result = pitch_detection_model(frame, verbose=False)[0]
+        keypoints = sv.KeyPoints.from_ultralytics(pitch_result)
+        
+        # Player detection
+        player_result = player_detection_model(
+            frame, imgsz=player_imgsz, conf=DEFAULT_PLAYER_CONF, verbose=False
+        )[0]
+        player_detections = sv.Detections.from_ultralytics(player_result)
+        player_detections = player_detections.with_nms(threshold=DEFAULT_NMS_THRESHOLD)
+        player_detections = player_tracker.update_with_detections(player_detections)
+        
+        # Ball detection with slicing
+        ball_detections = ball_slicer(frame).with_nms(threshold=DEFAULT_NMS_THRESHOLD)
+        ball_detections = ball_bytetrack.update_with_detections(ball_detections)
+        ball_detections = ball_tracker.update(ball_detections)
+        
+        # Team classification
+        players = player_detections[player_detections.class_id == PLAYER_CLASS_ID]
+        player_crops = get_crops(frame, players)
+        if len(player_crops) > 0:
+            players_team_id = team_classifier.predict(player_crops)
+        else:
+            players_team_id = np.array([])
+        
+        goalkeepers = player_detections[player_detections.class_id == GOALKEEPER_CLASS_ID]
+        if len(goalkeepers) > 0 and len(players) > 0 and len(players_team_id) > 0:
+            goalkeepers_team_id = resolve_goalkeepers_team_id(
+                players, players_team_id, goalkeepers)
+        else:
+            goalkeepers_team_id = np.array([])
+        
+        referees = player_detections[player_detections.class_id == REFEREE_CLASS_ID]
+        
+        # Merge all player detections
+        all_player_detections = sv.Detections.merge([players, goalkeepers, referees])
+        if len(all_player_detections) > 0:
+            color_lookup = np.array(
+                players_team_id.tolist() +
+                goalkeepers_team_id.tolist() +
+                [REFEREE_CLASS_ID] * len(referees)
+            )
+            labels = [str(tracker_id) for tracker_id in all_player_detections.tracker_id]
+        else:
+            color_lookup = np.array([])
+            labels = []
+        
+        # Annotate frame
+        annotated_frame = frame.copy()
+        
+        # Draw players with team colors
+        if len(all_player_detections) > 0:
+            annotated_frame = ELLIPSE_ANNOTATOR.annotate(
+                annotated_frame, all_player_detections, custom_color_lookup=color_lookup)
+            annotated_frame = ELLIPSE_LABEL_ANNOTATOR.annotate(
+                annotated_frame, all_player_detections, labels, custom_color_lookup=color_lookup)
+        
+        # Draw ball
+        if len(ball_detections) > 0:
+            annotated_frame = ball_annotator.annotate(annotated_frame, ball_detections)
+        
+        # Draw radar overlay
+        if len(all_player_detections) > 0:
+            try:
+                h, w, _ = frame.shape
+                radar = render_radar(all_player_detections, keypoints, color_lookup)
+                radar = sv.resize_image(radar, (w // 2, h // 2))
+                radar_h, radar_w, _ = radar.shape
+                rect = sv.Rect(
+                    x=w // 2 - radar_w // 2,
+                    y=h - radar_h,
+                    width=radar_w,
+                    height=radar_h
+                )
+                annotated_frame = sv.draw_image(annotated_frame, radar, opacity=0.5, rect=rect)
+            except Exception:
+                pass  # Skip radar if transformation fails
+        
+        yield annotated_frame
+
+
+def run_frame_extraction(
+    source_video_path: str,
+    output_dir: str,
+    device: str,
+    high_accuracy: bool = False
+) -> None:
+    """
+    Extract all frames from video, run detection, and save annotated frames as images.
+    
+    Args:
+        source_video_path: Path to the source video.
+        output_dir: Directory to save annotated frames and metadata.
+        device: Device to run the model on.
+        high_accuracy: Use higher accuracy settings.
+    
+    Output structure:
+        output_dir/
+            frames/          - All annotated frame images
+            metadata.json    - Detection data with timestamps
+            detections.csv   - CSV with frame-by-frame detections
+    """
+    setup_gpu_optimizations(device)
+    
+    # Create output directories
+    os.makedirs(output_dir, exist_ok=True)
+    frames_dir = os.path.join(output_dir, "frames")
+    os.makedirs(frames_dir, exist_ok=True)
+    
+    # Load models
+    print("[Frame Extraction] Loading models...")
+    player_detection_model = load_model(PLAYER_DETECTION_MODEL_PATH, device)
+    ball_detection_model = load_model(BALL_DETECTION_MODEL_PATH, device)
+    
+    # Get video info
+    video_info = sv.VideoInfo.from_video_path(source_video_path)
+    fps = video_info.fps if video_info.fps else 30.0
+    total_frames = video_info.total_frames
+    
+    print(f"[Frame Extraction] Video: {total_frames} frames @ {fps} FPS")
+    print(f"[Frame Extraction] Duration: {total_frames / fps:.2f} seconds")
+    print(f"[Frame Extraction] Output: {output_dir}")
+    
+    # Settings
+    player_imgsz = DEFAULT_PLAYER_IMGSZ if high_accuracy else 1280
+    ball_imgsz = DEFAULT_BALL_IMGSZ if high_accuracy else 640
+    
+    # Trackers
+    player_tracker = sv.ByteTrack(minimum_consecutive_frames=3)
+    ball_tracker = BallTracker(buffer_size=30, velocity_alpha=0.3, max_prediction_frames=5)
+    ball_annotator = BallAnnotator(radius=6, buffer_size=10)
+    
+    # Ball slicer
+    def ball_callback(image_slice: np.ndarray) -> sv.Detections:
+        result = ball_detection_model(
+            image_slice, imgsz=ball_imgsz, conf=DEFAULT_BALL_CONF, verbose=False
+        )[0]
+        return sv.Detections.from_ultralytics(result)
+    
+    ball_slicer = create_inference_slicer(ball_callback, slice_wh=(640, 640))
+    
+    # Storage for metadata
+    all_detections: List[Dict[str, Any]] = []
+    
+    # Process frames
+    frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
+    
+    print("[Frame Extraction] Processing frames...")
+    for frame_idx, frame in enumerate(tqdm(frame_generator, total=total_frames, desc="Extracting")):
+        timestamp_sec = frame_idx / fps
+        timestamp_str = f"{int(timestamp_sec // 60):02d}:{timestamp_sec % 60:05.2f}"
+        
+        # Player detection
+        player_result = player_detection_model(
+            frame, imgsz=player_imgsz, conf=DEFAULT_PLAYER_CONF, verbose=False
+        )[0]
+        player_detections = sv.Detections.from_ultralytics(player_result)
+        player_detections = player_detections.with_nms(threshold=DEFAULT_NMS_THRESHOLD)
+        player_detections = player_tracker.update_with_detections(player_detections)
+        
+        # Ball detection
+        ball_detections = ball_slicer(frame).with_nms(threshold=DEFAULT_NMS_THRESHOLD)
+        ball_detections = ball_tracker.update(ball_detections)
+        
+        # Annotate frame
+        annotated_frame = frame.copy()
+        
+        # Add timestamp to frame
+        cv2.putText(
+            annotated_frame,
+            f"Frame: {frame_idx} | Time: {timestamp_str}",
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA
+        )
+        
+        # Draw player boxes
+        annotated_frame = BOX_ANNOTATOR.annotate(annotated_frame, player_detections)
+        labels = build_player_labels(player_detections)
+        annotated_frame = BOX_LABEL_ANNOTATOR.annotate(
+            annotated_frame, player_detections, labels=labels
+        )
+        
+        # Draw ball
+        if len(ball_detections) > 0:
+            annotated_frame = ball_annotator.annotate(annotated_frame, ball_detections)
+        
+        # Save frame
+        frame_filename = f"frame_{frame_idx:06d}.jpg"
+        cv2.imwrite(os.path.join(frames_dir, frame_filename), annotated_frame)
+        
+        # Collect detection data
+        frame_data = {
+            "frame_index": frame_idx,
+            "timestamp_sec": round(timestamp_sec, 3),
+            "timestamp_str": timestamp_str,
+            "players": [],
+            "ball": None
+        }
+        
+        # Player data
+        for i in range(len(player_detections)):
+            bbox = player_detections.xyxy[i].tolist()
+            tracker_id = int(player_detections.tracker_id[i]) if player_detections.tracker_id is not None else None
+            class_id = int(player_detections.class_id[i]) if player_detections.class_id is not None else None
+            conf = float(player_detections.confidence[i]) if player_detections.confidence is not None else None
+            
+            frame_data["players"].append({
+                "tracker_id": tracker_id,
+                "class": CLASS_NAME_LOOKUP.get(class_id, "unknown"),
+                "class_id": class_id,
+                "bbox": [round(x, 1) for x in bbox],
+                "confidence": round(conf, 3) if conf else None
+            })
+        
+        # Ball data
+        if len(ball_detections) > 0:
+            ball_bbox = ball_detections.xyxy[0].tolist()
+            ball_center = ball_detections.get_anchors_coordinates(sv.Position.CENTER)[0].tolist()
+            ball_conf = float(ball_detections.confidence[0]) if ball_detections.confidence is not None else None
+            frame_data["ball"] = {
+                "bbox": [round(x, 1) for x in ball_bbox],
+                "center": [round(x, 1) for x in ball_center],
+                "confidence": round(ball_conf, 3) if ball_conf else None
+            }
+        
+        all_detections.append(frame_data)
+    
+    # Save metadata JSON
+    metadata_path = os.path.join(output_dir, "metadata.json")
+    print(f"[Frame Extraction] Saving metadata to {metadata_path}")
+    with open(metadata_path, 'w', encoding='utf-8') as f:
+        json.dump({
+            "video_info": {
+                "source": source_video_path,
+                "total_frames": total_frames,
+                "fps": fps,
+                "duration_sec": round(total_frames / fps, 2),
+                "width": video_info.width,
+                "height": video_info.height
+            },
+            "frames": all_detections
+        }, f, indent=2)
+    
+    # Save CSV for easy viewing
+    csv_path = os.path.join(output_dir, "detections.csv")
+    print(f"[Frame Extraction] Saving CSV to {csv_path}")
+    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "frame", "timestamp", "num_players", "ball_detected",
+            "ball_x", "ball_y", "player_ids"
+        ])
+        for det in all_detections:
+            ball_x = det["ball"]["center"][0] if det["ball"] else ""
+            ball_y = det["ball"]["center"][1] if det["ball"] else ""
+            player_ids = ",".join(str(p["tracker_id"]) for p in det["players"] if p["tracker_id"])
+            writer.writerow([
+                det["frame_index"],
+                det["timestamp_str"],
+                len(det["players"]),
+                "Yes" if det["ball"] else "No",
+                ball_x,
+                ball_y,
+                player_ids
+            ])
+    
+    print(f"\n✅ Done! Output saved to: {output_dir}")
+    print(f"   - Frames: {frames_dir}/ ({total_frames} images)")
+    print(f"   - Metadata: {metadata_path}")
+    print(f"   - CSV: {csv_path}")
+
+
 def main(
     source_video_path: str,
     target_video_path: str,
@@ -701,8 +1240,19 @@ def main(
     mode: Mode,
     show_preview: bool = False,
     ball_output_dir: Optional[str] = None,
-    pass_csv_path: Optional[str] = None
+    pass_csv_path: Optional[str] = None,
+    high_accuracy: bool = False,
+    output_dir: Optional[str] = None
 ) -> None:
+    if mode == Mode.FRAME_EXTRACTION:
+        run_frame_extraction(
+            source_video_path=source_video_path,
+            output_dir=output_dir or os.path.join(PARENT_DIR, "extracted_frames"),
+            device=device,
+            high_accuracy=high_accuracy
+        )
+        return
+    
     if mode == Mode.BALL_DETECTION_RECOVERY:
         run_ball_detection_with_recovery(
             source_video_path=source_video_path,
@@ -710,28 +1260,32 @@ def main(
             device=device,
             output_dir=ball_output_dir or os.path.join(PARENT_DIR, "ball_outputs"),
             pass_csv_path=pass_csv_path,
-            show_preview=show_preview
+            show_preview=show_preview,
+            high_accuracy=high_accuracy
         )
         return
 
     if mode == Mode.PITCH_DETECTION:
         frame_generator = run_pitch_detection(
-            source_video_path=source_video_path, device=device)
+            source_video_path=source_video_path, device=device, high_accuracy=high_accuracy)
     elif mode == Mode.PLAYER_DETECTION:
         frame_generator = run_player_detection(
-            source_video_path=source_video_path, device=device)
+            source_video_path=source_video_path, device=device, high_accuracy=high_accuracy)
     elif mode == Mode.BALL_DETECTION:
         frame_generator = run_ball_detection(
-            source_video_path=source_video_path, device=device)
+            source_video_path=source_video_path, device=device, high_accuracy=high_accuracy)
     elif mode == Mode.PLAYER_TRACKING:
         frame_generator = run_player_tracking(
-            source_video_path=source_video_path, device=device)
+            source_video_path=source_video_path, device=device, high_accuracy=high_accuracy)
     elif mode == Mode.TEAM_CLASSIFICATION:
         frame_generator = run_team_classification(
-            source_video_path=source_video_path, device=device)
+            source_video_path=source_video_path, device=device, high_accuracy=high_accuracy)
     elif mode == Mode.RADAR:
         frame_generator = run_radar(
-            source_video_path=source_video_path, device=device)
+            source_video_path=source_video_path, device=device, high_accuracy=high_accuracy)
+    elif mode == Mode.COMBINED_DETECTION:
+        frame_generator = run_combined_detection(
+            source_video_path=source_video_path, device=device, high_accuracy=high_accuracy)
     else:
         raise NotImplementedError(f"Mode {mode} is not implemented.")
 
@@ -748,14 +1302,22 @@ def main(
         cv2.destroyAllWindows()
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='')
-    parser.add_argument('--source_video_path', type=str, required=True)
-    parser.add_argument('--target_video_path', type=str, required=True)
-    parser.add_argument('--device', type=str, default='cpu')
-    parser.add_argument('--mode', type=Mode, default=Mode.PLAYER_DETECTION)
+    parser = argparse.ArgumentParser(description='Soccer AI - Player and Ball Detection')
+    parser.add_argument('--source_video_path', type=str, required=True,
+                       help='Path to input video file')
+    parser.add_argument('--target_video_path', type=str, default='output.mp4',
+                       help='Path to output video file (not used for FRAME_EXTRACTION)')
+    parser.add_argument('--device', type=str, default='cpu',
+                       help='Device to run on (cpu, cuda)')
+    parser.add_argument('--mode', type=Mode, default=Mode.PLAYER_DETECTION,
+                       help='Detection mode')
+    parser.add_argument('--output_dir', type=str, default=None,
+                       help='Output directory for FRAME_EXTRACTION mode')
     parser.add_argument('--ball_output_dir', type=str, default=None)
     parser.add_argument('--pass_csv_path', type=str, default=None)
     parser.add_argument('--show_preview', action='store_true')
+    parser.add_argument('--high_accuracy', action='store_true',
+                       help='Use high accuracy mode (higher resolution, better tracking)')
     args = parser.parse_args()
     main(
         source_video_path=args.source_video_path,
@@ -764,5 +1326,7 @@ if __name__ == '__main__':
         mode=args.mode,
         show_preview=args.show_preview,
         ball_output_dir=args.ball_output_dir,
-        pass_csv_path=args.pass_csv_path
+        pass_csv_path=args.pass_csv_path,
+        high_accuracy=args.high_accuracy,
+        output_dir=args.output_dir
     )

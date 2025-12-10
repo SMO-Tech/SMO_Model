@@ -1,5 +1,5 @@
 import pathlib
-import setuptools
+import setuptools  # type: ignore[reportMissingModuleSource]
 
 # The directory containing this file
 HERE = pathlib.Path(__file__).parent
