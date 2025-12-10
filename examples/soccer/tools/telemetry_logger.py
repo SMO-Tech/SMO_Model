@@ -191,7 +191,12 @@ def log_frames(
     frame_generator = sv.get_video_frames_generator(str(video_path))
 
     tracker = sv.ByteTrack(minimum_consecutive_frames=3)
-    ball_tracker = BallTracker(buffer_size=20)
+    # Use enhanced BallTracker with velocity prediction
+    ball_tracker = BallTracker(
+        buffer_size=30,
+        velocity_alpha=0.3,
+        max_prediction_frames=5
+    )
     transformer: Optional[ViewTransformer] = None
     last_ball_pitch: Optional[np.ndarray] = None
     last_ball_frame: Optional[int] = None

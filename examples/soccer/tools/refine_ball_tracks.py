@@ -17,11 +17,11 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 
-import cv2
-import numpy as np
-import supervision as sv
-from tqdm import tqdm
-from ultralytics import YOLO
+import cv2  # type: ignore[import-untyped]
+import numpy as np  # type: ignore[import-untyped]
+import supervision as sv  # type: ignore[import-untyped]
+from tqdm import tqdm  # type: ignore[import-untyped]
+from ultralytics import YOLO  # type: ignore[import-untyped]
 
 TOOLS_DIR = Path(__file__).resolve().parent
 ROOT_DIR = TOOLS_DIR.parent
