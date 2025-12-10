@@ -148,22 +148,35 @@ def handler(event):
         # Note: telemetry_logger.py now nests output under video_path.stem automatically
         video_analysis_dir = analysis_dir / video_path.stem
         
-        # Step 1: Run telemetry logger
-        print("Step 1: Generating telemetry data...")
+        # Step 1: Run telemetry logger (use fast GPU-optimized version)
+        print("Step 1: Generating telemetry data (GPU optimized)...")
         telemetry_path = video_analysis_dir / 'telemetry.jsonl'
         metadata_path = video_analysis_dir / 'metadata.json'
         gaps_path = video_analysis_dir / 'ball_gap_windows.json'
         
-        # Import and run telemetry logger
+        # Import and run FAST telemetry logger (GPU optimized)
         import sys
         sys.argv = [
-            'telemetry_logger.py',
+            'fast_telemetry_logger.py',
             '--source_video_path', str(video_path),
             '--output_dir', str(analysis_dir),
             '--device', device,
-            '--sample_stride', '120'
+            '--half'  # Use FP16 for faster GPU inference
         ]
-        from tools.telemetry_logger import main as telemetry_main
+        try:
+            from tools.fast_telemetry_logger import main as telemetry_main
+            print("   Using fast GPU-optimized telemetry logger (FP16)")
+        except ImportError:
+            # Fallback to regular telemetry logger
+            from tools.telemetry_logger import main as telemetry_main
+            sys.argv = [
+                'telemetry_logger.py',
+                '--source_video_path', str(video_path),
+                '--output_dir', str(analysis_dir),
+                '--device', device,
+                '--sample_stride', '120'
+            ]
+            print("   Using standard telemetry logger")
         telemetry_main()
         
         if not telemetry_path.exists():
