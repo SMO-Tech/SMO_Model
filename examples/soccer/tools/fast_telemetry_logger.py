@@ -189,12 +189,15 @@ def process_video_fast(
                 half=use_half and device == "cuda"
             )[0]
             keypoints = sv.KeyPoints.from_ultralytics(pitch_res)
-            mask = (keypoints.xy[0][:, 0] > 1) & (keypoints.xy[0][:, 1] > 1)
-            if mask.sum() >= 4:
-                transformer = ViewTransformer(
-                    source=keypoints.xy[0][mask].astype(np.float32),
-                    target=np.array(CONFIG.vertices)[mask].astype(np.float32),
-                )
+            
+            # Check if keypoints were detected (handle intro/logo frames)
+            if len(keypoints.xy) > 0 and len(keypoints.xy[0]) > 0:
+                mask = (keypoints.xy[0][:, 0] > 1) & (keypoints.xy[0][:, 1] > 1)
+                if mask.sum() >= 4:
+                    transformer = ViewTransformer(
+                        source=keypoints.xy[0][mask].astype(np.float32),
+                        target=np.array(CONFIG.vertices)[mask].astype(np.float32),
+                    )
             
             # Player detection with optimized settings
             player_res = models["player"](

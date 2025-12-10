@@ -44,7 +44,7 @@ def update_match_status(
             request_headers.update(headers)
         
         print(f"[API] Updating match {match_id} status to '{status}'...")
-        response = requests.post(
+        response = requests.put(
             api_url,
             json=payload,
             headers=request_headers,
