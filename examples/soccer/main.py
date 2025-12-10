@@ -1237,7 +1237,8 @@ def run_frame_extraction(
     high_accuracy: bool = False
 ) -> None:
     """
-    Extract all frames from video, run detection, and save annotated frames as images.
+    Extract all frames from video, run detection with team classification,
+    and save annotated frames as images.
     
     Args:
         source_video_path: Path to the source video.
@@ -1250,6 +1251,8 @@ def run_frame_extraction(
             frames/          - All annotated frame images
             metadata.json    - Detection data with timestamps
             detections.csv   - CSV with frame-by-frame detections
+            passes.csv       - Pass events with team info
+            passes.json      - Detailed pass data
     """
     setup_gpu_optimizations(device)
     
@@ -1276,6 +1279,28 @@ def run_frame_extraction(
     player_imgsz = DEFAULT_PLAYER_IMGSZ if high_accuracy else 1280
     ball_imgsz = DEFAULT_BALL_IMGSZ if high_accuracy else 640
     
+    # ========== PHASE 1: Collect crops for team classification ==========
+    print("[Frame Extraction] Phase 1: Collecting player crops for team classification...")
+    frame_generator = sv.get_video_frames_generator(
+        source_path=source_video_path, stride=STRIDE)
+    
+    crops = []
+    for frame in tqdm(frame_generator, desc="Collecting crops"):
+        result = player_detection_model(
+            frame, imgsz=player_imgsz, conf=DEFAULT_PLAYER_CONF, verbose=False
+        )[0]
+        detections = sv.Detections.from_ultralytics(result)
+        crops += get_crops(frame, detections[detections.class_id == PLAYER_CLASS_ID])
+    
+    # Train team classifier
+    print(f"[Frame Extraction] Training team classifier on {len(crops)} player crops...")
+    team_classifier = TeamClassifier(device=device)
+    team_classifier.fit(crops)
+    print("[Frame Extraction] Team classifier ready!")
+    
+    # ========== PHASE 2: Process all frames with team classification ==========
+    print("[Frame Extraction] Phase 2: Processing frames with team classification...")
+    
     # Trackers
     player_tracker = sv.ByteTrack(minimum_consecutive_frames=3)
     ball_tracker = BallTracker(buffer_size=30, velocity_alpha=0.3, max_prediction_frames=5)
@@ -1293,10 +1318,12 @@ def run_frame_extraction(
     # Storage for metadata
     all_detections: List[Dict[str, Any]] = []
     
+    # Track team assignments per tracker_id (for consistency)
+    tracker_team_votes: Dict[int, List[int]] = {}  # tracker_id -> list of team votes
+    
     # Process frames
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
     
-    print("[Frame Extraction] Processing frames...")
     for frame_idx, frame in enumerate(tqdm(frame_generator, total=total_frames, desc="Extracting")):
         timestamp_sec = frame_idx / fps
         timestamp_str = f"{int(timestamp_sec // 60):02d}:{timestamp_sec % 60:05.2f}"
@@ -1309,9 +1336,72 @@ def run_frame_extraction(
         player_detections = player_detections.with_nms(threshold=DEFAULT_NMS_THRESHOLD)
         player_detections = player_tracker.update_with_detections(player_detections)
         
+        # Separate players, goalkeepers, referees
+        players = player_detections[player_detections.class_id == PLAYER_CLASS_ID]
+        goalkeepers = player_detections[player_detections.class_id == GOALKEEPER_CLASS_ID]
+        referees = player_detections[player_detections.class_id == REFEREE_CLASS_ID]
+        
+        # Team classification for players
+        player_crops = get_crops(frame, players)
+        if len(player_crops) > 0:
+            players_team_id = team_classifier.predict(player_crops)
+        else:
+            players_team_id = np.array([])
+        
+        # Team classification for goalkeepers (based on proximity to team centroids)
+        if len(goalkeepers) > 0 and len(players) > 0 and len(players_team_id) > 0:
+            goalkeepers_team_id = resolve_goalkeepers_team_id(players, players_team_id, goalkeepers)
+        else:
+            goalkeepers_team_id = np.array([])
+        
+        # Build team lookup for this frame
+        frame_team_lookup: Dict[int, int] = {}  # tracker_id -> team_id
+        
+        # Players
+        if players.tracker_id is not None:
+            for idx, tracker_id in enumerate(players.tracker_id):
+                if tracker_id is not None and idx < len(players_team_id):
+                    tid = int(tracker_id)
+                    team_id = int(players_team_id[idx])
+                    frame_team_lookup[tid] = team_id
+                    # Vote for consistent team assignment
+                    if tid not in tracker_team_votes:
+                        tracker_team_votes[tid] = []
+                    tracker_team_votes[tid].append(team_id)
+        
+        # Goalkeepers
+        if goalkeepers.tracker_id is not None:
+            for idx, tracker_id in enumerate(goalkeepers.tracker_id):
+                if tracker_id is not None and idx < len(goalkeepers_team_id):
+                    tid = int(tracker_id)
+                    team_id = int(goalkeepers_team_id[idx])
+                    frame_team_lookup[tid] = team_id
+                    if tid not in tracker_team_votes:
+                        tracker_team_votes[tid] = []
+                    tracker_team_votes[tid].append(team_id)
+        
+        # Referees get team_id = -1
+        if referees.tracker_id is not None:
+            for tracker_id in referees.tracker_id:
+                if tracker_id is not None:
+                    frame_team_lookup[int(tracker_id)] = -1
+        
         # Ball detection
         ball_detections = ball_slicer(frame).with_nms(threshold=DEFAULT_NMS_THRESHOLD)
         ball_detections = ball_tracker.update(ball_detections)
+        
+        # Merge all detections for annotation
+        all_player_detections = sv.Detections.merge([players, goalkeepers, referees])
+        
+        # Build color lookup for visualization
+        if len(all_player_detections) > 0:
+            color_lookup = np.array(
+                players_team_id.tolist() +
+                goalkeepers_team_id.tolist() +
+                [REFEREE_CLASS_ID] * len(referees)
+            )
+        else:
+            color_lookup = np.array([])
         
         # Annotate frame
         annotated_frame = frame.copy()
@@ -1328,12 +1418,13 @@ def run_frame_extraction(
             cv2.LINE_AA
         )
         
-        # Draw player boxes
-        annotated_frame = BOX_ANNOTATOR.annotate(annotated_frame, player_detections)
-        labels = build_player_labels(player_detections)
-        annotated_frame = BOX_LABEL_ANNOTATOR.annotate(
-            annotated_frame, player_detections, labels=labels
-        )
+        # Draw players with team colors
+        if len(all_player_detections) > 0:
+            annotated_frame = ELLIPSE_ANNOTATOR.annotate(
+                annotated_frame, all_player_detections, custom_color_lookup=color_lookup)
+            labels = [f"#{tid}" for tid in all_player_detections.tracker_id]
+            annotated_frame = ELLIPSE_LABEL_ANNOTATOR.annotate(
+                annotated_frame, all_player_detections, labels, custom_color_lookup=color_lookup)
         
         # Draw ball
         if len(ball_detections) > 0:
@@ -1343,7 +1434,7 @@ def run_frame_extraction(
         frame_filename = f"frame_{frame_idx:06d}.jpg"
         cv2.imwrite(os.path.join(frames_dir, frame_filename), annotated_frame)
         
-        # Collect detection data
+        # Collect detection data with team info
         frame_data = {
             "frame_index": frame_idx,
             "timestamp_sec": round(timestamp_sec, 3),
@@ -1352,17 +1443,28 @@ def run_frame_extraction(
             "ball": None
         }
         
-        # Player data
-        for i in range(len(player_detections)):
-            bbox = player_detections.xyxy[i].tolist()
-            tracker_id = int(player_detections.tracker_id[i]) if player_detections.tracker_id is not None else None
-            class_id = int(player_detections.class_id[i]) if player_detections.class_id is not None else None
-            conf = float(player_detections.confidence[i]) if player_detections.confidence is not None else None
+        # Player data with team
+        for i in range(len(all_player_detections)):
+            bbox = all_player_detections.xyxy[i].tolist()
+            tracker_id = int(all_player_detections.tracker_id[i]) if all_player_detections.tracker_id is not None else None
+            class_id = int(all_player_detections.class_id[i]) if all_player_detections.class_id is not None else None
+            conf = float(all_player_detections.confidence[i]) if all_player_detections.confidence is not None else None
+            team_id = frame_team_lookup.get(tracker_id, -1) if tracker_id else -1
+            
+            # Get team name
+            if team_id == 0:
+                team_name = "Team A"
+            elif team_id == 1:
+                team_name = "Team B"
+            else:
+                team_name = "Referee" if class_id == REFEREE_CLASS_ID else "Unknown"
             
             frame_data["players"].append({
                 "tracker_id": tracker_id,
                 "class": CLASS_NAME_LOOKUP.get(class_id, "unknown"),
                 "class_id": class_id,
+                "team_id": team_id,
+                "team": team_name,
                 "bbox": [round(x, 1) for x in bbox],
                 "confidence": round(conf, 3) if conf else None
             })
@@ -1380,6 +1482,13 @@ def run_frame_extraction(
         
         all_detections.append(frame_data)
     
+    # Build final consistent team assignments (majority vote)
+    final_team_lookup: Dict[int, int] = {}
+    for tracker_id, votes in tracker_team_votes.items():
+        if votes:
+            # Majority vote
+            final_team_lookup[tracker_id] = max(set(votes), key=votes.count)
+    
     # Save metadata JSON
     metadata_path = os.path.join(output_dir, "metadata.json")
     print(f"[Frame Extraction] Saving metadata to {metadata_path}")
@@ -1396,23 +1505,30 @@ def run_frame_extraction(
             "frames": all_detections
         }, f, indent=2)
     
-    # Save CSV for easy viewing
+    # Save CSV for easy viewing (with team info)
     csv_path = os.path.join(output_dir, "detections.csv")
     print(f"[Frame Extraction] Saving detections CSV to {csv_path}")
     with open(csv_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         writer.writerow([
-            "frame", "timestamp", "num_players", "ball_detected",
-            "ball_x", "ball_y", "player_ids"
+            "frame", "timestamp", "num_players", 
+            "team_a_players", "team_b_players", "referees",
+            "ball_detected", "ball_x", "ball_y", "player_ids"
         ])
         for det in all_detections:
             ball_x = det["ball"]["center"][0] if det["ball"] else ""
             ball_y = det["ball"]["center"][1] if det["ball"] else ""
             player_ids = ",".join(str(p["tracker_id"]) for p in det["players"] if p["tracker_id"])
+            team_a = len([p for p in det["players"] if p.get("team_id") == 0])
+            team_b = len([p for p in det["players"] if p.get("team_id") == 1])
+            refs = len([p for p in det["players"] if p.get("team_id") == -1])
             writer.writerow([
                 det["frame_index"],
                 det["timestamp_str"],
                 len(det["players"]),
+                team_a,
+                team_b,
+                refs,
                 "Yes" if det["ball"] else "No",
                 ball_x,
                 ball_y,
@@ -1422,7 +1538,7 @@ def run_frame_extraction(
     # ========== PASS DETECTION ==========
     print("[Frame Extraction] Detecting passes...")
     
-    # Convert detections to format expected by pass detection
+    # Convert detections to format expected by pass detection (with team info)
     frames_for_pass_detection = []
     for det in all_detections:
         player_tracks = []
@@ -1434,6 +1550,8 @@ def run_frame_extraction(
                 player_tracks.append({
                     "tracker_id": p["tracker_id"],
                     "class_id": p["class_id"],
+                    "team_id": p.get("team_id", -1),
+                    "team": p.get("team", "Unknown"),
                     "bottom_center": bottom_center
                 })
         
@@ -1451,14 +1569,52 @@ def run_frame_extraction(
     # Detect passes with improved logic
     pass_events = detect_passes_enhanced(frames_for_pass_detection, fps)
     
-    # Save passes CSV
+    # Add team info to pass events using final_team_lookup
+    for evt in pass_events:
+        passer_id = evt["passer_id"]
+        receiver_id = evt["receiver_id"]
+        
+        # Get team for passer
+        passer_team_id = final_team_lookup.get(passer_id, -1)
+        if passer_team_id == 0:
+            evt["passer_team"] = "Team A"
+        elif passer_team_id == 1:
+            evt["passer_team"] = "Team B"
+        else:
+            evt["passer_team"] = "Unknown"
+        evt["passer_team_id"] = passer_team_id
+        
+        # Get team for receiver
+        receiver_team_id = final_team_lookup.get(receiver_id, -1)
+        if receiver_team_id == 0:
+            evt["receiver_team"] = "Team A"
+        elif receiver_team_id == 1:
+            evt["receiver_team"] = "Team B"
+        else:
+            evt["receiver_team"] = "Unknown"
+        evt["receiver_team_id"] = receiver_team_id
+        
+        # Determine if same team or interception
+        if passer_team_id == receiver_team_id and passer_team_id >= 0:
+            evt["same_team"] = True
+            evt["pass_result"] = "Completed"
+        elif passer_team_id >= 0 and receiver_team_id >= 0:
+            evt["same_team"] = False
+            evt["pass_result"] = "Intercepted"
+        else:
+            evt["same_team"] = None
+            evt["pass_result"] = "Unknown"
+    
+    # Save passes CSV with team info
     passes_csv_path = os.path.join(output_dir, "passes.csv")
     print(f"[Frame Extraction] Saving passes CSV to {passes_csv_path}")
     with open(passes_csv_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         writer.writerow([
-            "pass_id", "pass_type",
-            "initiator_id", "receiver_id",
+            "pass_id", "pass_type", "pass_result",
+            "initiator_id", "initiator_team",
+            "receiver_id", "receiver_team",
+            "same_team",
             "start_frame", "start_timestamp",
             "end_frame", "end_timestamp",
             "duration_sec", "distance_px"
@@ -1467,8 +1623,12 @@ def run_frame_extraction(
             writer.writerow([
                 i,
                 evt["pass_type"],
+                evt.get("pass_result", "Unknown"),
                 evt["passer_id"],
+                evt.get("passer_team", "Unknown"),
                 evt["receiver_id"],
+                evt.get("receiver_team", "Unknown"),
+                "Yes" if evt.get("same_team") else "No" if evt.get("same_team") is False else "",
                 evt["start_frame"],
                 evt["start_timestamp_str"],
                 evt["end_frame"],
@@ -1477,13 +1637,26 @@ def run_frame_extraction(
                 round(evt["distance_px"], 1)
             ])
     
+    # Calculate team stats
+    team_a_passes = len([e for e in pass_events if e.get("passer_team_id") == 0])
+    team_b_passes = len([e for e in pass_events if e.get("passer_team_id") == 1])
+    completed_passes = len([e for e in pass_events if e.get("pass_result") == "Completed"])
+    intercepted_passes = len([e for e in pass_events if e.get("pass_result") == "Intercepted"])
+    
     # Save passes JSON for detailed data
     passes_json_path = os.path.join(output_dir, "passes.json")
     with open(passes_json_path, 'w', encoding='utf-8') as f:
         json.dump({
             "total_passes": len(pass_events),
             "short_passes": len([e for e in pass_events if e["pass_type"] == "short"]),
+            "medium_passes": len([e for e in pass_events if e["pass_type"] == "medium"]),
             "long_passes": len([e for e in pass_events if e["pass_type"] == "long"]),
+            "team_stats": {
+                "team_a_passes": team_a_passes,
+                "team_b_passes": team_b_passes,
+                "completed_passes": completed_passes,
+                "intercepted_passes": intercepted_passes
+            },
             "passes": pass_events
         }, f, indent=2)
     
@@ -1491,8 +1664,13 @@ def run_frame_extraction(
     print(f"   - Frames: {frames_dir}/ ({total_frames} images)")
     print(f"   - Metadata: {metadata_path}")
     print(f"   - Detections CSV: {csv_path}")
-    print(f"   - Passes CSV: {passes_csv_path} ({len(pass_events)} passes detected)")
-    print(f"   - Passes JSON: {passes_json_path}")
+    print(f"   - Passes CSV: {passes_csv_path}")
+    print(f"\n📊 Pass Statistics:")
+    print(f"   - Total passes: {len(pass_events)}")
+    print(f"   - Team A passes: {team_a_passes}")
+    print(f"   - Team B passes: {team_b_passes}")
+    print(f"   - Completed: {completed_passes}")
+    print(f"   - Intercepted: {intercepted_passes}")
 
 
 def main(
