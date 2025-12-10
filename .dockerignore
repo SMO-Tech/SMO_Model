@@ -1,0 +1,45 @@
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info
+dist/
+build/
+.venv/
+venv/
+vnev/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Documentation
+*.md
+docs/
+README*
+
+# Data and outputs
+examples/soccer/data/*.pt
+examples/soccer/data/*.mp4
+examples/soccer/data/analysis/
+examples/soccer/input_video/
+*.jsonl
+*.csv
+*.json
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+

@@ -1,2 +1,7 @@
 ultralytics
 gdown
+requests
+supervision
+opencv-python
+numpy
+tqdm
