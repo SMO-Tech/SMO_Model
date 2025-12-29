@@ -1,0 +1,13 @@
+# FALLBACK: Use this if main requirements.txt still causes the 340 vs 339 error
+# This uses transformers < 4.51 which doesn't have the KV cache bug
+torch>=2.0.0
+torchvision>=0.15.0
+transformers>=4.40.0,<4.51.0  # Use version before the bug
+ultralytics>=8.0.0
+supervision>=0.18.0
+opencv-python>=4.8.0
+pillow>=10.0.0
+numpy>=1.24.0
+tqdm>=4.66.0
+accelerate>=0.25.0
+
